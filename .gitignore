@@ -216,3 +216,21 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Secrets
+*.env
+api.env
+.env
+.env.*
+
+# Runtime state
+sanctions.json
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Backups
+*.bak
+*.backup
