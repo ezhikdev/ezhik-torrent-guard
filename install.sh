@@ -2,7 +2,7 @@
 
 set -o pipefail
 
-APP_VERSION="1.0.0"
+APP_VERSION="1.0.1"
 REPO_RAW="https://raw.githubusercontent.com/ezhikdev/ezhik-torrent-guard/main"
 APP_DIR="/opt/ezhik-torrent-guard"
 SURICATA_PREFIX="/opt/ezhik-suricata-8.0.6"
@@ -38,6 +38,173 @@ info() { printf '\033[1;34m[INFO]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ OK ]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
+
+INSTALL_STARTED_AT="$(date +%s)"
+SPINNER_CHARS='|/-\\'
+
+format_elapsed() {
+    local seconds="$1"
+    printf '%02d:%02d' $((seconds / 60)) $((seconds % 60))
+}
+
+ui_line() {
+    # Best-effort terminal output. Build commands continue even if the SSH TTY disappears.
+    printf '%b' "$*" 2>/dev/null || true
+}
+
+progress_status() {
+    local pct="$1"
+    shift
+    ui_line "\\r\\033[2K\\033[1;36m[$(printf '%3d' "$pct")%]\\033[0m $*"
+}
+
+progress_done() {
+    local pct="$1"
+    shift
+    ui_line "\\r\\033[2K\\033[1;36m[$(printf '%3d' "$pct")%]\\033[0m $* \\033[1;32mOK\\033[0m\\n"
+}
+
+run_timed_logged() {
+    local pct="$1"
+    local label="$2"
+    shift 2
+    local started now elapsed frame=0 pid rc
+
+    started="$(date +%s)"
+    "$@" >>"$INSTALL_LOG" 2>&1 &
+    pid=$!
+
+    while kill -0 "$pid" 2>/dev/null; do
+        now="$(date +%s)"
+        elapsed=$((now - started))
+        local spin="${SPINNER_CHARS:$((frame % 4)):1}"
+        progress_status "$pct" "$label  $spin  elapsed $(format_elapsed "$elapsed")"
+        frame=$((frame + 1))
+        sleep 1
+    done
+
+    wait "$pid"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        ui_line "\\n"
+        tail -n 50 "$INSTALL_LOG" >&2 2>/dev/null || true
+        die "$label failed (exit $rc). Log: $INSTALL_LOG"
+    fi
+
+    now="$(date +%s)"
+    elapsed=$((now - started))
+    progress_done "$pct" "$label  ($(format_elapsed "$elapsed"))"
+}
+
+download_with_progress() {
+    local pct="$1"
+    local label="$2"
+    local url="$3"
+    local dest="$4"
+
+    progress_status "$pct" "$label"
+    ui_line "\\n"
+
+    # curl's own progress bar reports the real byte percentage.
+    if ! curl -fL --retry 3 --connect-timeout 15 --progress-bar "$url" -o "$dest"; then
+        die "$label failed. Log: $INSTALL_LOG"
+    fi
+
+    progress_done "$pct" "$label"
+}
+
+count_ndpi_work() {
+    local root="$1"
+    find "$root/src" "$root/example" -type f \
+        \( -name '*.o' -o -name '*.lo' \) 2>/dev/null | wc -l
+}
+
+count_ndpi_total() {
+    local root="$1"
+    find "$root/src" "$root/example" -type f \
+        \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' \) 2>/dev/null | wc -l
+}
+
+count_suricata_work() {
+    local root="$1"
+    local c rust
+    c="$(find "$root/src" "$root/plugins" -type f \
+        \( -name '*.o' -o -name '*.lo' \) 2>/dev/null | wc -l)"
+    rust="$(find "$root/rust/target/release/deps" -maxdepth 1 -type f \
+        \( -name '*.rlib' -o -name '*.so' \) 2>/dev/null | wc -l)"
+    printf '%d' $((c + rust))
+}
+
+count_suricata_total() {
+    local root="$1"
+    local c rust
+    c="$(find "$root/src" "$root/plugins" -type f -name '*.c' 2>/dev/null | wc -l)"
+    rust="$(grep -c '^\[\[package\]\]' "$root/rust/Cargo.lock" 2>/dev/null || true)"
+    printf '%d' $((c + rust))
+}
+
+latest_build_activity() {
+    tail -n 120 "$INSTALL_LOG" 2>/dev/null | \
+        grep -E '(^|[[:space:]])(CC|CXX|CCLD|AR|LD)[[:space:]]|Compiling |Building |Linking |Finished ' | \
+        tail -n 1 | sed -E 's/^[[:space:]]+//; s/[[:space:]]+/ /g' | cut -c1-68
+}
+
+run_build_progress() {
+    local overall_start="$1"
+    local overall_end="$2"
+    local label="$3"
+    local kind="$4"
+    local root="$5"
+    shift 5
+
+    local started now elapsed frame=0 pid rc total done sub overall activity spin
+
+    case "$kind" in
+        ndpi) total="$(count_ndpi_total "$root")" ;;
+        suricata) total="$(count_suricata_total "$root")" ;;
+        *) total=0 ;;
+    esac
+    [ "${total:-0}" -gt 0 ] || total=1
+
+    started="$(date +%s)"
+    "$@" >>"$INSTALL_LOG" 2>&1 &
+    pid=$!
+
+    while kill -0 "$pid" 2>/dev/null; do
+        case "$kind" in
+            ndpi) done="$(count_ndpi_work "$root")" ;;
+            suricata) done="$(count_suricata_work "$root")" ;;
+            *) done=0 ;;
+        esac
+
+        sub=$((done * 100 / total))
+        [ "$sub" -lt 0 ] && sub=0
+        [ "$sub" -gt 98 ] && sub=98
+        overall=$((overall_start + (overall_end - overall_start) * sub / 100))
+
+        now="$(date +%s)"
+        elapsed=$((now - started))
+        spin="${SPINNER_CHARS:$((frame % 4)):1}"
+        activity="$(latest_build_activity)"
+        [ -n "$activity" ] || activity="compiler active"
+
+        progress_status "$overall" "$label  $spin  build ~$(printf '%2d' "$sub")%  $(format_elapsed "$elapsed")  $activity"
+        frame=$((frame + 1))
+        sleep 1
+    done
+
+    wait "$pid"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        ui_line "\\n"
+        tail -n 60 "$INSTALL_LOG" >&2 2>/dev/null || true
+        die "$label failed (exit $rc). Log: $INSTALL_LOG"
+    fi
+
+    now="$(date +%s)"
+    elapsed=$((now - started))
+    progress_done "$overall_end" "$label  build 100%  ($(format_elapsed "$elapsed"))"
+}
 
 run_logged() {
     "$@" >>"$INSTALL_LOG" 2>&1
@@ -285,6 +452,10 @@ XRAY_LOG_NOTICE
     confirm "Continue installation anyway?" N || exit 1
 fi
 
+# From here onward installation is non-interactive. Ignore SIGHUP so a dropped SSH session
+# does not intentionally terminate the compiler/installer. Output may disappear, but the log remains.
+trap '' HUP
+
 if systemctl cat suricata.service >/dev/null 2>&1; then
     if systemctl is-active --quiet suricata.service 2>/dev/null || \
        systemctl is-enabled --quiet suricata.service 2>/dev/null; then
@@ -317,8 +488,8 @@ done
 ok "Repository files ready"
 
 info "Installing build dependencies (details: $INSTALL_LOG)..."
-run_logged apt-get update
-run_logged env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+run_timed_logged 22 "apt-get update" apt-get update
+run_timed_logged 30 "Installing build dependencies" env DEBIAN_FRONTEND=noninteractive apt-get install -y \
     ca-certificates curl git \
     autoconf automake build-essential cargo cbindgen gettext flex bison \
     libjansson-dev libjson-c-dev libpcap-dev libpcre2-dev libtool libyaml-dev \
@@ -345,60 +516,47 @@ rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR" || die "Cannot create $BUILD_DIR"
 
 info "Building strict nDPI 4.14..."
-curl -fL https://github.com/ntop/nDPI/archive/refs/tags/4.14.tar.gz \
-    -o "$BUILD_DIR/ndpi-4.14.tar.gz" >>"$INSTALL_LOG" 2>&1 || \
-    die "Cannot download nDPI 4.14"
-run_logged tar -xzf "$BUILD_DIR/ndpi-4.14.tar.gz" -C "$BUILD_DIR"
+download_with_progress 34 "Downloading nDPI 4.14" \
+    "https://github.com/ntop/nDPI/archive/refs/tags/4.14.tar.gz" \
+    "$BUILD_DIR/ndpi-4.14.tar.gz"
+run_timed_logged 36 "Extracting nDPI 4.14" tar -xzf "$BUILD_DIR/ndpi-4.14.tar.gz" -C "$BUILD_DIR"
 
 NDPI_STOCK="$BUILD_DIR/nDPI-4.14"
 NDPI_STRICT="$BUILD_DIR/nDPI-4.14-strict"
 [ -d "$NDPI_STOCK" ] || die "Unexpected nDPI archive layout."
 cp -a "$NDPI_STOCK" "$NDPI_STRICT" || die "Cannot create strict nDPI tree"
 
-run_logged python3 "$STAGE_DIR/scripts/patch_ndpi_strict.py" \
+run_timed_logged 38 "Applying strict BitTorrent patch" python3 \
+    "$STAGE_DIR/scripts/patch_ndpi_strict.py" \
     "$NDPI_STRICT/src/lib/protocols/bittorrent.c"
-
-(
-    cd "$NDPI_STRICT" || exit 1
-    ./autogen.sh >>"$INSTALL_LOG" 2>&1 && \
-    ./configure >>"$INSTALL_LOG" 2>&1 && \
-    nice -n 10 make -j2 >>"$INSTALL_LOG" 2>&1
-) || {
-    tail -n 50 "$INSTALL_LOG" >&2
-    die "strict nDPI build failed"
-}
+run_timed_logged 40 "Configuring nDPI build system" bash -lc \
+    "cd '$NDPI_STRICT' && ./autogen.sh && ./configure"
+run_build_progress 40 50 "Building strict nDPI" ndpi "$NDPI_STRICT" \
+    bash -lc "cd '$NDPI_STRICT' && nice -n 10 make -j2"
 
 [ -f "$NDPI_STRICT/src/lib/libndpi.a" ] || die "strict libndpi.a was not built"
 ok "strict nDPI 4.14 built"
 
 info "Building Suricata 8.0.6 with strict nDPI plugin..."
-curl -fL https://www.openinfosecfoundation.org/download/suricata-8.0.6.tar.gz \
-    -o "$BUILD_DIR/suricata-8.0.6.tar.gz" >>"$INSTALL_LOG" 2>&1 || \
-    die "Cannot download Suricata 8.0.6"
-run_logged tar -xzf "$BUILD_DIR/suricata-8.0.6.tar.gz" -C "$BUILD_DIR"
+download_with_progress 54 "Downloading Suricata 8.0.6" \
+    "https://www.openinfosecfoundation.org/download/suricata-8.0.6.tar.gz" \
+    "$BUILD_DIR/suricata-8.0.6.tar.gz"
+run_timed_logged 56 "Extracting Suricata 8.0.6" tar -xzf "$BUILD_DIR/suricata-8.0.6.tar.gz" -C "$BUILD_DIR"
 
 SURI_SRC="$BUILD_DIR/suricata-8.0.6"
 [ -d "$SURI_SRC" ] || die "Unexpected Suricata archive layout."
 
-run_logged python3 "$STAGE_DIR/scripts/patch_suricata_ndpi.py" \
+run_timed_logged 58 "Applying Suricata nDPI patch" python3 \
+    "$STAGE_DIR/scripts/patch_suricata_ndpi.py" \
     "$SURI_SRC/plugins/ndpi/ndpi.c"
 
 rm -rf "$SURICATA_PREFIX"
-(
-    cd "$SURI_SRC" || exit 1
-    ./configure \
-        --prefix="$SURICATA_PREFIX" \
-        --sysconfdir="$SURICATA_PREFIX/etc" \
-        --localstatedir="$SURICATA_PREFIX/var" \
-        --enable-ndpi \
-        --with-ndpi="$NDPI_STRICT" >>"$INSTALL_LOG" 2>&1 && \
-    nice -n 10 make -j2 >>"$INSTALL_LOG" 2>&1 && \
-    make install >>"$INSTALL_LOG" 2>&1 && \
-    make install-conf >>"$INSTALL_LOG" 2>&1
-) || {
-    tail -n 60 "$INSTALL_LOG" >&2
-    die "Suricata build/install failed"
-}
+run_timed_logged 60 "Configuring Suricata 8.0.6" bash -lc \
+    "cd '$SURI_SRC' && ./configure --prefix='$SURICATA_PREFIX' --sysconfdir='$SURICATA_PREFIX/etc' --localstatedir='$SURICATA_PREFIX/var' --enable-ndpi --with-ndpi='$NDPI_STRICT'"
+run_build_progress 60 82 "Building Suricata 8.0.6" suricata "$SURI_SRC" \
+    bash -lc "cd '$SURI_SRC' && nice -n 10 make -j2"
+run_timed_logged 85 "Installing Suricata runtime" bash -lc \
+    "cd '$SURI_SRC' && make install && make install-conf"
 
 SURICATA_BIN="$SURICATA_PREFIX/bin/suricata"
 SURICATA_CONFIG="$SURICATA_PREFIX/etc/suricata/suricata.yaml"
@@ -413,6 +571,8 @@ if ldd "$PLUGIN_SRC" 2>/dev/null | grep -q 'not found'; then
 fi
 ok "Suricata 8.0.6 built"
 
+progress_status 88 "Installing Torrent Guard files"
+ui_line "\n"
 info "Installing Torrent Guard files..."
 mkdir -p "$APP_DIR/suricata" "$APP_DIR/lib" "$CONFIG_DIR" "$STATE_DIR" || \
     die "Cannot create application directories"
@@ -457,13 +617,15 @@ run_logged python3 "$STAGE_DIR/scripts/render_suricata_config.py" \
 : >/dev/shm/ezhik-suricata-fast.log
 chmod 600 /dev/shm/ezhik-suricata-fast.log || true
 
+progress_status 93 "Validating Suricata configuration"
+ui_line "\n"
 info "Validating Suricata configuration..."
 "$SURICATA_BIN" -T -c "$SURICATA_CONFIG" \
     -S "$APP_DIR/suricata/ezhik-torrent-only.rules" >>"$INSTALL_LOG" 2>&1 || {
         tail -n 60 "$INSTALL_LOG" >&2
         die "Suricata configuration test failed"
     }
-ok "Suricata configuration valid"
+progress_done 95 "Suricata configuration valid"
 
 install -m 644 "$STAGE_DIR/systemd/ezhik-torrent-guard.service" \
     /etc/systemd/system/ezhik-torrent-guard.service || die "Cannot install Guard unit"
@@ -484,6 +646,8 @@ install -m 644 "$STAGE_DIR/systemd/ezhik-torrent-guard-cleanup.conf" \
     /etc/systemd/system/ezhik-torrent-guard.service.d/cleanup.conf || \
     die "Cannot install cleanup drop-in"
 
+progress_status 97 "Installing and enabling systemd services"
+ui_line "\n"
 systemctl daemon-reload || die "systemd daemon-reload failed"
 systemctl enable ezhik-suricata.service ezhik-torrent-guard.service ezhik-ram-log-guard.service \
     >>"$INSTALL_LOG" 2>&1 || die "Could not enable services"
@@ -505,6 +669,7 @@ for svc in ezhik-suricata ezhik-torrent-guard ezhik-ram-log-guard; do
     fi
 done
 [ "$FAILED" -eq 0 ] || die "One or more services failed to start."
+progress_done 100 "Torrent Guard installation complete"
 
 PLUGIN_SHA="$(sha256sum "$APP_DIR/lib/ndpi.so" | awk '{print $1}')"
 SURI_VERSION="$($SURICATA_BIN --build-info 2>/dev/null | sed -n 's/^This is Suricata version /Suricata /p' | head -n1)"
