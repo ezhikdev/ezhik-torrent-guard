@@ -1,0 +1,19 @@
+[Unit]
+Description=Ezhik Torrent Guard
+After=network-online.target docker.service ezhik-suricata.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ezhik-torrent-guard
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/ezhik-torrent-guard/settings.env
+ExecStart=/usr/bin/python3 /opt/ezhik-torrent-guard/guard.py
+Restart=always
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

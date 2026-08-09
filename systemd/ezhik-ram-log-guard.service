@@ -1,0 +1,14 @@
+[Unit]
+Description=Ezhik Torrent Guard RAM Log Guard
+After=docker.service ezhik-suricata.service
+Wants=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/ezhik-torrent-guard/settings.env
+ExecStart=/usr/local/sbin/ezhik-ram-log-guard.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

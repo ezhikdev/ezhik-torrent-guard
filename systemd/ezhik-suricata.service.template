@@ -1,0 +1,18 @@
+[Unit]
+Description=Ezhik Passive BitTorrent Sensor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@@SURICATA_BIN@@ \
+  -c @@SURICATA_CONFIG@@ \
+  --af-packet=@@WAN_IF@@ \
+  -S /opt/ezhik-torrent-guard/suricata/ezhik-torrent-only.rules
+Restart=always
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

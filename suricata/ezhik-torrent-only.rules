@@ -1,0 +1,1 @@
+alert ip any any -> any any (msg:"EZHIK nDPI BitTorrent flow"; ndpi-protocol:BitTorrent; flowbits:isnotset,ezhik_bt_seen; flowbits:set,ezhik_bt_seen; sid:9900010; rev:3;)
