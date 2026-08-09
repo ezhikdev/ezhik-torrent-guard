@@ -73,6 +73,11 @@ _queued = set()
 
 _sanctions = {}
 
+# client -> persistent freeze attempt state.
+# Kept separately from confirmed sanctions so an ambiguous disable request
+# can be recovered safely after API/network failures or Guard restarts.
+_pending_freezes = {}
+
 _base_url = None
 _token = None
 
@@ -160,8 +165,9 @@ def _save_state_locked():
     )
 
     data = {
-        "version": 1,
+        "version": 2,
         "sanctions": _sanctions,
+        "pending_freezes": _pending_freezes,
     }
 
     tmp.write_text(
@@ -193,6 +199,7 @@ def _save_state_locked():
 def _load_state():
 
     global _sanctions
+    global _pending_freezes
 
     STATE_DIR.mkdir(
         parents=True,
@@ -209,6 +216,7 @@ def _load_state():
         with _lock:
 
             _sanctions = {}
+            _pending_freezes = {}
 
             _save_state_locked()
 
@@ -227,6 +235,11 @@ def _load_state():
             {},
         )
 
+        pending_freezes = raw.get(
+            "pending_freezes",
+            {},
+        )
+
         if not isinstance(
             sanctions,
             dict,
@@ -234,6 +247,12 @@ def _load_state():
             raise ValueError(
                 "sanctions is not object"
             )
+
+        if not isinstance(
+            pending_freezes,
+            dict,
+        ):
+            pending_freezes = {}
 
         cleaned = {}
 
@@ -264,9 +283,114 @@ def _load_state():
 
             cleaned[str(client)] = rec
 
+        cleaned_pending = {}
+
+        for client, rec in pending_freezes.items():
+
+            client = str(client)
+
+            if not client.isdigit():
+                continue
+
+            if not isinstance(rec, dict):
+                continue
+
+            # A confirmed sanction always wins over a pending attempt.
+            if client in cleaned:
+                continue
+
+            uuid = rec.get("uuid")
+
+            if uuid is not None and (
+                not isinstance(uuid, str)
+                or not uuid
+            ):
+                uuid = None
+
+            created_at = rec.get(
+                "created_at",
+                time.time(),
+            )
+
+            next_retry_at = rec.get(
+                "next_retry_at",
+                time.time(),
+            )
+
+            if not isinstance(
+                created_at,
+                (int, float),
+            ):
+                created_at = time.time()
+
+            if not isinstance(
+                next_retry_at,
+                (int, float),
+            ):
+                next_retry_at = time.time()
+
+            try:
+                disable_attempts = max(
+                    0,
+                    int(
+                        rec.get(
+                            "disable_attempts",
+                            0,
+                        )
+                        or 0
+                    ),
+                )
+            except Exception:
+                disable_attempts = 0
+
+            ambiguous_since = rec.get(
+                "ambiguous_since"
+            )
+
+            if not isinstance(
+                ambiguous_since,
+                (int, float),
+            ):
+                ambiguous_since = None
+
+            last_disable_attempt_at = rec.get(
+                "last_disable_attempt_at"
+            )
+
+            if not isinstance(
+                last_disable_attempt_at,
+                (int, float),
+            ):
+                last_disable_attempt_at = None
+
+            cleaned_pending[client] = {
+                "client_id": client,
+                "uuid": uuid,
+                "created_at": float(created_at),
+                "next_retry_at": float(next_retry_at),
+                "disable_attempts": disable_attempts,
+                "may_have_disabled": bool(
+                    rec.get("may_have_disabled", False)
+                ),
+                "ambiguous_since": (
+                    float(ambiguous_since)
+                    if ambiguous_since is not None
+                    else None
+                ),
+                "last_disable_attempt_at": (
+                    float(last_disable_attempt_at)
+                    if last_disable_attempt_at is not None
+                    else None
+                ),
+                "last_error": str(
+                    rec.get("last_error", "")
+                ),
+            }
+
         with _lock:
 
             _sanctions = cleaned
+            _pending_freezes = cleaned_pending
 
             _save_state_locked()
 
@@ -569,6 +693,185 @@ def _write_allowed(client):
 # FREEZE
 # ============================================================
 
+def _remove_pending_freeze(client):
+
+    with _lock:
+
+        _pending_freezes.pop(
+            client,
+            None,
+        )
+
+        _save_state_locked()
+
+
+def _ensure_pending_freeze(client):
+
+    with _lock:
+
+        rec = _pending_freezes.get(
+            client
+        )
+
+        if rec is None:
+
+            now = time.time()
+
+            rec = {
+                "client_id": client,
+                "uuid": None,
+                "created_at": now,
+                "next_retry_at": now,
+                "disable_attempts": 0,
+                "may_have_disabled": False,
+                "ambiguous_since": None,
+                "last_disable_attempt_at": None,
+                "last_error": "",
+            }
+
+            _pending_freezes[
+                client
+            ] = rec
+
+            _save_state_locked()
+
+        return dict(rec)
+
+
+def _freeze_retry_later(
+    client,
+    reason,
+    may_have_disabled=False,
+    ambiguous_at=None,
+):
+
+    with _lock:
+
+        rec = _pending_freezes.get(
+            client
+        )
+
+        if rec is None:
+            return
+
+        if may_have_disabled:
+
+            rec[
+                "may_have_disabled"
+            ] = True
+
+            if rec.get(
+                "ambiguous_since"
+            ) is None:
+
+                when = (
+                    ambiguous_at
+                    if isinstance(
+                        ambiguous_at,
+                        (int, float),
+                    )
+                    else time.time()
+                )
+
+                rec[
+                    "ambiguous_since"
+                ] = float(when)
+
+        rec[
+            "last_error"
+        ] = str(reason)
+
+        rec[
+            "next_retry_at"
+        ] = (
+            time.time()
+            + RETRY_SECONDS
+        )
+
+        _save_state_locked()
+
+        ambiguous = bool(
+            rec.get(
+                "may_have_disabled",
+                False,
+            )
+        )
+
+    print(
+        f"[FREEZE RETRY] "
+        f"client={client} "
+        f"in={RETRY_SECONDS}s "
+        f"reason={reason} "
+        f"may_have_disabled={'yes' if ambiguous else 'no'}",
+        flush=True,
+    )
+
+
+def _confirm_frozen(
+    client,
+    uuid,
+    source,
+    disabled_at=None,
+):
+
+    now = time.time()
+
+    if not isinstance(
+        disabled_at,
+        (int, float),
+    ):
+        disabled_at = now
+
+    # Never claim the disable predates the time we actually know about.
+    disabled_at = min(
+        float(disabled_at),
+        now,
+    )
+
+    unfreeze_at = (
+        disabled_at
+        + FREEZE_SECONDS
+    )
+
+    record = {
+        "client_id": client,
+        "uuid": uuid,
+        "disabled_at": disabled_at,
+        "unfreeze_at": unfreeze_at,
+        "next_retry_at": unfreeze_at,
+        "reason": "bittorrent",
+        "source": source,
+    }
+
+    with _lock:
+
+        _pending_freezes.pop(
+            client,
+            None,
+        )
+
+        _sanctions[
+            client
+        ] = record
+
+        _save_state_locked()
+
+    when = datetime.fromtimestamp(
+        unfreeze_at
+    ).astimezone()
+
+    print()
+    print(
+        f"[FROZEN] "
+        f"client={client} "
+        f"duration={FREEZE_SECONDS // 60}m "
+        f"until={when.isoformat(timespec='seconds')} "
+        f"source={source}",
+        flush=True,
+    )
+    print()
+
+
 def queue_freeze(client):
 
     client = str(
@@ -586,13 +889,35 @@ def queue_freeze(client):
 
             return False
 
+        if client in _pending_freezes:
+
+            return False
+
         if client in _queued:
 
             return False
 
+        now = time.time()
+
+        _pending_freezes[
+            client
+        ] = {
+            "client_id": client,
+            "uuid": None,
+            "created_at": now,
+            "next_retry_at": now,
+            "disable_attempts": 0,
+            "may_have_disabled": False,
+            "ambiguous_since": None,
+            "last_disable_attempt_at": None,
+            "last_error": "",
+        }
+
         _queued.add(
             client
         )
+
+        _save_state_locked()
 
     _actions.put(
         (
@@ -616,13 +941,29 @@ def _freeze(client):
     if not _write_allowed(
         client
     ):
+
+        _remove_pending_freeze(
+            client
+        )
+
         return
+
+    pending = _ensure_pending_freeze(
+        client
+    )
 
     user = _resolve_user(
         client
     )
 
     if user is None:
+
+        _freeze_retry_later(
+            client,
+            "resolve-failed",
+            may_have_disabled=False,
+        )
+
         return
 
     status = user.get(
@@ -633,10 +974,82 @@ def _freeze(client):
         "uuid"
     )
 
+    expected_uuid = pending.get(
+        "uuid"
+    )
+
+    if (
+        expected_uuid
+        and uuid != expected_uuid
+    ):
+
+        print(
+            f"[FREEZE SECURITY] "
+            f"client={client} "
+            f"uuid changed; "
+            f"refusing further writes",
+            flush=True,
+        )
+
+        _remove_pending_freeze(
+            client
+        )
+
+        return
+
+    with _lock:
+
+        rec = _pending_freezes.get(
+            client
+        )
+
+        if rec is None:
+            return
+
+        rec["uuid"] = uuid
+
+        may_have_disabled = bool(
+            rec.get(
+                "may_have_disabled",
+                False,
+            )
+        )
+
+        ambiguous_since = rec.get(
+            "ambiguous_since"
+        )
+
+        _save_state_locked()
+
+    # If an earlier disable request had an ambiguous outcome and the
+    # same user is now DISABLED, assume our prior request succeeded.
+    # This is the key recovery path for: POST reached panel -> user was
+    # disabled -> response/connection was lost.
+    if (
+        status == "DISABLED"
+        and may_have_disabled
+    ):
+
+        print(
+            f"[FREEZE RECOVERED] "
+            f"client={client} "
+            f"already DISABLED after ambiguous prior attempt; "
+            f"treating disable as Torrent Guard owned",
+            flush=True,
+        )
+
+        _confirm_frozen(
+            client,
+            uuid,
+            "recovered-ambiguous-disable",
+            disabled_at=ambiguous_since,
+        )
+
+        return
+
     # Critical safety:
-    # if user is already disabled / expired / limited,
-    # Torrent Guard did NOT disable them and therefore
-    # must NOT schedule an automatic enable.
+    # on the first attempt, or after failures that definitely did not
+    # perform a write, an already non-ACTIVE user is NOT ours.
     if status != "ACTIVE":
 
         print(
@@ -647,7 +1060,46 @@ def _freeze(client):
             flush=True,
         )
 
+        _remove_pending_freeze(
+            client
+        )
+
         return
+
+    with _lock:
+
+        rec = _pending_freezes.get(
+            client
+        )
+
+        if rec is None:
+            return
+
+        had_ambiguous_prior_attempt = bool(
+            rec.get(
+                "may_have_disabled",
+                False,
+            )
+        )
+
+        prior_ambiguous_since = rec.get(
+            "ambiguous_since"
+        )
+
+        attempt_started = time.time()
+
+        rec["disable_attempts"] = int(
+            rec.get(
+                "disable_attempts",
+                0,
+            )
+        ) + 1
+
+        rec[
+            "last_disable_attempt_at"
+        ] = attempt_started
+
+        _save_state_locked()
 
     code, payload = _api(
         "POST",
@@ -665,55 +1117,25 @@ def _freeze(client):
             "status"
         )
 
-        if new_status != "DISABLED":
+        if new_status == "DISABLED":
 
-            print(
-                f"[API ERROR] "
-                f"disable client={client} "
-                f"http=200 "
-                f"unexpected_status={new_status}",
-                flush=True,
+            _confirm_frozen(
+                client,
+                uuid,
+                "api-200",
             )
 
             return
 
-        now = time.time()
-
-        unfreeze_at = (
-            now
-            + FREEZE_SECONDS
+        # HTTP 200 with an unexpected body is ambiguous: the write may
+        # have happened, so preserve ownership uncertainty and verify on
+        # the next pass instead of losing the sanction.
+        _freeze_retry_later(
+            client,
+            f"http-200-unexpected-status-{new_status}",
+            may_have_disabled=True,
+            ambiguous_at=attempt_started,
         )
-
-        record = {
-            "client_id": client,
-            "uuid": uuid,
-            "disabled_at": now,
-            "unfreeze_at": unfreeze_at,
-            "next_retry_at": unfreeze_at,
-            "reason": "bittorrent",
-        }
-
-        with _lock:
-
-            _sanctions[
-                client
-            ] = record
-
-            _save_state_locked()
-
-        when = datetime.fromtimestamp(
-            unfreeze_at
-        ).astimezone()
-
-        print()
-        print(
-            f"[FROZEN] "
-            f"client={client} "
-            f"duration={FREEZE_SECONDS // 60}m "
-            f"until={when.isoformat(timespec='seconds')}",
-            flush=True,
-        )
-        print()
 
         return
 
@@ -721,18 +1143,89 @@ def _freeze(client):
         payload
     )
 
-    # Already disabled:
-    # IMPORTANT: do not create Torrent Guard sanction,
-    # because Guard does not own this disable.
+    # FIRST attempt returns A029 -> user was already disabled before
+    # Torrent Guard owned any ambiguous write. Never auto-enable them.
+    #
+    # A029 AFTER an earlier ambiguous disable attempt -> the previous
+    # request may have succeeded and only its response was lost. Treat
+    # that disable as ours and start the normal freeze timer.
     if error_code == "A029":
+
+        if had_ambiguous_prior_attempt:
+
+            print(
+                f"[FREEZE RECOVERED] "
+                f"client={client} "
+                f"A029 after ambiguous prior disable; "
+                f"treating disable as Torrent Guard owned",
+                flush=True,
+            )
+
+            _confirm_frozen(
+                client,
+                uuid,
+                "recovered-A029",
+                disabled_at=prior_ambiguous_since,
+            )
+
+            return
 
         print(
             f"[FREEZE SKIP] "
             f"client={client} "
             f"already disabled "
-            f"(A029); "
+            f"(A029) on first disable attempt; "
             f"no auto-unfreeze",
             flush=True,
+        )
+
+        _remove_pending_freeze(
+            client
+        )
+
+        return
+
+    # No HTTP response / server-side failure can be ambiguous: the
+    # panel may have committed the disable before the response was lost.
+    if (
+        code == 0
+        or code >= 500
+    ):
+
+        _freeze_retry_later(
+            client,
+            f"http-{code}-error-{error_code}",
+            may_have_disabled=True,
+            ambiguous_at=attempt_started,
+        )
+
+        return
+
+    # HTTP 408 is ambiguous for a POST: depending on the proxy/server,
+    # the action may have reached the application before the timeout was
+    # reported. Preserve ownership uncertainty and verify on retry.
+    if code == 408:
+
+        _freeze_retry_later(
+            client,
+            f"http-{code}-error-{error_code}",
+            may_have_disabled=True,
+            ambiguous_at=attempt_started,
+        )
+
+        return
+
+    # These transient responses normally reject the request before the
+    # action is committed. Retry, but do not claim ownership.
+    if code in {
+        425,
+        429,
+    }:
+
+        _freeze_retry_later(
+            client,
+            f"http-{code}-error-{error_code}",
+            may_have_disabled=False,
         )
 
         return
@@ -741,8 +1234,54 @@ def _freeze(client):
         f"[API ERROR] "
         f"disable client={client} "
         f"http={code} "
-        f"error={error_code}",
+        f"error={error_code}; "
+        f"not retrying deterministic failure",
         flush=True,
+    )
+
+    _remove_pending_freeze(
+        client
+    )
+
+
+def _process_due_freezes():
+
+    now = time.time()
+
+    with _lock:
+
+        due = []
+
+        for client, rec in (
+            _pending_freezes.items()
+        ):
+
+            # Initial queued action owns this client until its first
+            # processing attempt finishes.
+            if client in _queued:
+                continue
+
+            next_retry_at = float(
+                rec.get(
+                    "next_retry_at",
+                    0,
+                )
+            )
+
+            if now >= next_retry_at:
+                due.append(
+                    (next_retry_at, client)
+                )
+
+    if not due:
+        return
+
+    # Process only one retry per worker pass so a dead panel cannot make
+    # a large pending-freeze backlog starve due unfreezes.
+    due.sort()
+
+    _freeze(
+        due[0][1]
     )
 
 
@@ -1010,6 +1549,7 @@ def _worker():
 
     while _running.is_set():
 
+        _process_due_freezes()
         _process_due_unfreezes()
 
         try:
@@ -1087,6 +1627,10 @@ def start():
             _sanctions
         )
 
+        pending_freezes_count = len(
+            _pending_freezes
+        )
+
     allow = (
         "ALL"
         if WRITE_ALLOWLIST is None
@@ -1101,7 +1645,8 @@ def start():
         f"[REMNAWAVE] "
         f"API worker started "
         f"allowlist={allow} "
-        f"pending_sanctions={sanctions_count}",
+        f"pending_sanctions={sanctions_count} "
+        f"pending_freezes={pending_freezes_count}",
         flush=True,
     )
 
