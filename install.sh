@@ -102,13 +102,87 @@ download_with_progress() {
     local url="$3"
     local dest="$4"
 
-    progress_status "$pct" "$label"
-    ui_line "\\n"
+    local total=0 current=0 percent=0
+    local width=24 filled empty
+    local bar_fill bar_empty
+    local started now elapsed
+    local pid rc
 
-    # curl's own progress bar reports the real byte percentage.
-    if ! curl -fL --retry 3 --connect-timeout 15 --progress-bar "$url" -o "$dest"; then
-        die "$label failed. Log: $INSTALL_LOG"
+    rm -f "$dest"
+
+    # Пытаемся узнать размер файла заранее.
+    total="$(
+        curl -fsSIL --retry 2 --connect-timeout 15 "$url" 2>>"$INSTALL_LOG" |
+        awk '
+            BEGIN { IGNORECASE=1 }
+            /^content-length:/ {
+                gsub("\r", "", $2)
+                if ($2 ~ /^[0-9]+$/)
+                    size=$2
+            }
+            END { print size+0 }
+        '
+    )"
+
+    started="$(date +%s)"
+
+    # Сам curl работает тихо в фоне.
+    curl -fL \
+        --retry 3 \
+        --connect-timeout 15 \
+        --silent \
+        --show-error \
+        "$url" \
+        -o "$dest" >>"$INSTALL_LOG" 2>&1 &
+
+    pid=$!
+
+    while kill -0 "$pid" 2>/dev/null; do
+        current="$(stat -c '%s' "$dest" 2>/dev/null || printf '0')"
+
+        now="$(date +%s)"
+        elapsed=$((now - started))
+
+        if [ "$total" -gt 0 ]; then
+            percent=$((current * 100 / total))
+            [ "$percent" -gt 99 ] && percent=99
+
+            filled=$((percent * width / 100))
+            empty=$((width - filled))
+
+            printf -v bar_fill '%*s' "$filled" ''
+            printf -v bar_empty '%*s' "$empty" ''
+
+            bar_fill="${bar_fill// /#}"
+            bar_empty="${bar_empty// /-}"
+
+            current_mb="$(awk "BEGIN {printf \"%.1f\", $current/1048576}")"
+            total_mb="$(awk "BEGIN {printf \"%.1f\", $total/1048576}")"
+
+            progress_status "$pct" \
+                "$label  [${bar_fill}${bar_empty}] $(printf '%3d' "$percent")%  ${current_mb}/${total_mb} MiB  $(format_elapsed "$elapsed")"
+        else
+            current_mb="$(awk "BEGIN {printf \"%.1f\", $current/1048576}")"
+
+            progress_status "$pct" \
+                "$label  downloaded ${current_mb} MiB  $(format_elapsed "$elapsed")"
+        fi
+
+        sleep 0.5
+    done
+
+    wait "$pid"
+    rc=$?
+
+    if [ "$rc" -ne 0 ]; then
+        ui_line "\\n"
+        tail -n 30 "$INSTALL_LOG" >&2 2>/dev/null || true
+        die "$label failed (exit $rc). Log: $INSTALL_LOG"
     fi
+
+    progress_status "$pct" \
+        "$label  [########################] 100%"
+    sleep 0.2
 
     progress_done "$pct" "$label"
 }
