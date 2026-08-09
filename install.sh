@@ -2,7 +2,7 @@
 
 set -o pipefail
 
-APP_VERSION="1.0.1"
+APP_VERSION="1.0.2"
 REPO_RAW="https://raw.githubusercontent.com/ezhikdev/ezhik-torrent-guard/main"
 APP_DIR="/opt/ezhik-torrent-guard"
 SURICATA_PREFIX="/opt/ezhik-suricata-8.0.6"
@@ -106,7 +106,7 @@ download_with_progress() {
     local width=24 filled empty
     local bar_fill bar_empty
     local started now elapsed
-    local pid rc
+    local pid rc current_mb total_mb
 
     rm -f "$dest"
 
@@ -405,6 +405,25 @@ check_xray_logs() {
         >/dev/null 2>&1
 }
 
+ensure_suricata_yaml_header() {
+    local config="$1"
+
+    python3 - "$config" <<'PY_YAML_HEADER'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+lines = p.read_text().splitlines()
+
+# Suricata 8 requires these to be the first two lines. The renderer uses
+# PyYAML, which does not preserve the original YAML directive/document marker.
+while lines and lines[0].strip() in ("%YAML 1.1", "---"):
+    lines.pop(0)
+
+p.write_text("%YAML 1.1\n---\n" + "\n".join(lines) + "\n")
+PY_YAML_HEADER
+}
+
 banner
 
 [ "${EUID:-$(id -u)}" -eq 0 ] || die "Run installer as root."
@@ -469,7 +488,7 @@ ok "WAN: $WAN_IF / $WAN_IP"
 printf '\n' >/dev/tty
 PANEL_URL="$(prompt 'Remnawave panel domain or URL')"
 PANEL_URL="$(normalize_panel_url "$PANEL_URL")"
-API_TOKEN="$(prompt_secret 'Remnawave API key')"
+API_TOKEN="$(prompt_secret 'Remnawave Panel API token (paste token only)')"
 [ -n "$API_TOKEN" ] || die "API key cannot be empty."
 
 PROTECTED_RAW="$(prompt 'Protected Remnawave client IDs, comma-separated (optional)' '')"
@@ -505,7 +524,10 @@ if [ "$HTTP_CODE" != "200" ]; then
         "$PANEL_URL/api/users" 2>>"$INSTALL_LOG" || true)"
 fi
 
-[ "$HTTP_CODE" = "200" ] || die "Remnawave API authentication failed (HTTP ${HTTP_CODE:-0})."
+if [ "$HTTP_CODE" != "200" ]; then
+    [ "$HTTP_CODE" != "401" ] || warn 'HTTP 401: paste the Panel API token only — without "Bearer " and without REMNAWAVE_API_TOKEN='
+    die "Remnawave API authentication failed (HTTP ${HTTP_CODE:-0})."
+fi
 ok "Remnawave API authentication successful"
 
 if check_xray_logs; then
@@ -586,64 +608,85 @@ ok "Rust toolchain: $(rustc --version)"
 systemctl stop ezhik-torrent-guard.service ezhik-ram-log-guard.service ezhik-suricata.service \
     >/dev/null 2>&1 || true
 
-rm -rf "$BUILD_DIR"
-mkdir -p "$BUILD_DIR" || die "Cannot create $BUILD_DIR"
-
-info "Building strict nDPI 4.14..."
-download_with_progress 34 "Downloading nDPI 4.14" \
-    "https://github.com/ntop/nDPI/archive/refs/tags/4.14.tar.gz" \
-    "$BUILD_DIR/ndpi-4.14.tar.gz"
-run_timed_logged 36 "Extracting nDPI 4.14" tar -xzf "$BUILD_DIR/ndpi-4.14.tar.gz" -C "$BUILD_DIR"
-
 NDPI_STOCK="$BUILD_DIR/nDPI-4.14"
 NDPI_STRICT="$BUILD_DIR/nDPI-4.14-strict"
-[ -d "$NDPI_STOCK" ] || die "Unexpected nDPI archive layout."
-cp -a "$NDPI_STOCK" "$NDPI_STRICT" || die "Cannot create strict nDPI tree"
-
-run_timed_logged 38 "Applying strict BitTorrent patch" python3 \
-    "$STAGE_DIR/scripts/patch_ndpi_strict.py" \
-    "$NDPI_STRICT/src/lib/protocols/bittorrent.c"
-run_timed_logged 40 "Configuring nDPI build system" bash -lc \
-    "cd '$NDPI_STRICT' && ./autogen.sh && ./configure"
-run_build_progress 40 50 "Building strict nDPI" ndpi "$NDPI_STRICT" \
-    bash -lc "cd '$NDPI_STRICT' && nice -n 10 make -j2"
-
-[ -f "$NDPI_STRICT/src/lib/libndpi.a" ] || die "strict libndpi.a was not built"
-ok "strict nDPI 4.14 built"
-
-info "Building Suricata 8.0.6 with strict nDPI plugin..."
-download_with_progress 54 "Downloading Suricata 8.0.6" \
-    "https://www.openinfosecfoundation.org/download/suricata-8.0.6.tar.gz" \
-    "$BUILD_DIR/suricata-8.0.6.tar.gz"
-run_timed_logged 56 "Extracting Suricata 8.0.6" tar -xzf "$BUILD_DIR/suricata-8.0.6.tar.gz" -C "$BUILD_DIR"
-
 SURI_SRC="$BUILD_DIR/suricata-8.0.6"
-[ -d "$SURI_SRC" ] || die "Unexpected Suricata archive layout."
-
-run_timed_logged 58 "Applying Suricata nDPI patch" python3 \
-    "$STAGE_DIR/scripts/patch_suricata_ndpi.py" \
-    "$SURI_SRC/plugins/ndpi/ndpi.c"
-
-rm -rf "$SURICATA_PREFIX"
-run_timed_logged 60 "Configuring Suricata 8.0.6" bash -lc \
-    "cd '$SURI_SRC' && ./configure --prefix='$SURICATA_PREFIX' --sysconfdir='$SURICATA_PREFIX/etc' --localstatedir='$SURICATA_PREFIX/var' --enable-ndpi --with-ndpi='$NDPI_STRICT'"
-run_build_progress 60 82 "Building Suricata 8.0.6" suricata "$SURI_SRC" \
-    bash -lc "cd '$SURI_SRC' && nice -n 10 make -j2"
-run_timed_logged 85 "Installing Suricata runtime" bash -lc \
-    "cd '$SURI_SRC' && make install && make install-conf"
-
 SURICATA_BIN="$SURICATA_PREFIX/bin/suricata"
 SURICATA_CONFIG="$SURICATA_PREFIX/etc/suricata/suricata.yaml"
-[ -x "$SURICATA_BIN" ] || die "Suricata binary not installed at $SURICATA_BIN"
-[ -f "$SURICATA_CONFIG" ] || die "Suricata config not installed at $SURICATA_CONFIG"
+BUILD_READY_MARKER="$BUILD_DIR/.ezhik-runtime-ready-suricata-8.0.6-ndpi-4.14"
+PLUGIN_SRC="$SURI_SRC/plugins/ndpi/.libs/ndpi.so"
+REUSE_BUILD=0
 
-PLUGIN_SRC="$(find "$SURI_SRC/plugins/ndpi" -type f -path '*/.libs/ndpi.so' | head -n1)"
-[ -f "$PLUGIN_SRC" ] || die "strict Suricata nDPI plugin was not built"
-if ldd "$PLUGIN_SRC" 2>/dev/null | grep -q 'not found'; then
-    ldd "$PLUGIN_SRC" >&2 || true
-    die "strict nDPI plugin has missing runtime libraries"
+# If a previous run finished compilation but failed later (for example during
+# config validation), reuse the verified build instead of wasting 10+ minutes.
+if [ -f "$BUILD_READY_MARKER" ] && \
+   [ -f "$NDPI_STRICT/src/lib/libndpi.a" ] && \
+   [ -x "$SURICATA_BIN" ] && \
+   [ -f "$SURICATA_CONFIG" ] && \
+   [ -f "$PLUGIN_SRC" ] && \
+   ! ldd "$PLUGIN_SRC" 2>/dev/null | grep -q 'not found'; then
+    REUSE_BUILD=1
+    ok "Previous completed nDPI/Suricata build detected; reusing it"
+    progress_done 85 "Reusing completed Suricata build"
 fi
-ok "Suricata 8.0.6 built"
+
+if [ "$REUSE_BUILD" -eq 0 ]; then
+    rm -rf "$BUILD_DIR"
+    mkdir -p "$BUILD_DIR" || die "Cannot create $BUILD_DIR"
+
+    info "Building strict nDPI 4.14..."
+    download_with_progress 34 "Downloading nDPI 4.14" \
+        "https://github.com/ntop/nDPI/archive/refs/tags/4.14.tar.gz" \
+        "$BUILD_DIR/ndpi-4.14.tar.gz"
+    run_timed_logged 36 "Extracting nDPI 4.14" tar -xzf "$BUILD_DIR/ndpi-4.14.tar.gz" -C "$BUILD_DIR"
+
+    [ -d "$NDPI_STOCK" ] || die "Unexpected nDPI archive layout."
+    cp -a "$NDPI_STOCK" "$NDPI_STRICT" || die "Cannot create strict nDPI tree"
+
+    run_timed_logged 38 "Applying strict BitTorrent patch" python3 \
+        "$STAGE_DIR/scripts/patch_ndpi_strict.py" \
+        "$NDPI_STRICT/src/lib/protocols/bittorrent.c"
+    run_timed_logged 40 "Configuring nDPI build system" bash -lc \
+        "cd '$NDPI_STRICT' && ./autogen.sh && ./configure"
+    run_build_progress 40 50 "Building strict nDPI" ndpi "$NDPI_STRICT" \
+        bash -lc "cd '$NDPI_STRICT' && nice -n 10 make -j2"
+
+    [ -f "$NDPI_STRICT/src/lib/libndpi.a" ] || die "strict libndpi.a was not built"
+    ok "strict nDPI 4.14 built"
+
+    info "Building Suricata 8.0.6 with strict nDPI plugin..."
+    download_with_progress 54 "Downloading Suricata 8.0.6" \
+        "https://www.openinfosecfoundation.org/download/suricata-8.0.6.tar.gz" \
+        "$BUILD_DIR/suricata-8.0.6.tar.gz"
+    run_timed_logged 56 "Extracting Suricata 8.0.6" tar -xzf "$BUILD_DIR/suricata-8.0.6.tar.gz" -C "$BUILD_DIR"
+
+    [ -d "$SURI_SRC" ] || die "Unexpected Suricata archive layout."
+
+    run_timed_logged 58 "Applying Suricata nDPI patch" python3 \
+        "$STAGE_DIR/scripts/patch_suricata_ndpi.py" \
+        "$SURI_SRC/plugins/ndpi/ndpi.c"
+
+    rm -rf "$SURICATA_PREFIX"
+    run_timed_logged 60 "Configuring Suricata 8.0.6" bash -lc \
+        "cd '$SURI_SRC' && ./configure --prefix='$SURICATA_PREFIX' --sysconfdir='$SURICATA_PREFIX/etc' --localstatedir='$SURICATA_PREFIX/var' --enable-ndpi --with-ndpi='$NDPI_STRICT'"
+    run_build_progress 60 82 "Building Suricata 8.0.6" suricata "$SURI_SRC" \
+        bash -lc "cd '$SURI_SRC' && nice -n 10 make -j2"
+    run_timed_logged 85 "Installing Suricata runtime" bash -lc \
+        "cd '$SURI_SRC' && make install && make install-conf"
+
+    [ -x "$SURICATA_BIN" ] || die "Suricata binary not installed at $SURICATA_BIN"
+    [ -f "$SURICATA_CONFIG" ] || die "Suricata config not installed at $SURICATA_CONFIG"
+    [ -f "$PLUGIN_SRC" ] || die "strict Suricata nDPI plugin was not built"
+    if ldd "$PLUGIN_SRC" 2>/dev/null | grep -q 'not found'; then
+        ldd "$PLUGIN_SRC" >&2 || true
+        die "strict nDPI plugin has missing runtime libraries"
+    fi
+
+    # Keep this marker until the whole installer succeeds. If a later step fails,
+    # the next run can safely skip compilation. BUILD_DIR is deleted on success.
+    : >"$BUILD_READY_MARKER"
+    ok "Suricata 8.0.6 built"
+fi
 
 progress_status 88 "Installing Torrent Guard files"
 ui_line "\n"
@@ -687,6 +730,14 @@ chmod 600 "$CONFIG_DIR/hold.txt"
 
 run_logged python3 "$STAGE_DIR/scripts/render_suricata_config.py" \
     "$SURICATA_CONFIG" "$WAN_IF" "$WAN_IP" "$APP_DIR/lib/ndpi.so"
+
+# The renderer rewrites YAML and may drop Suricata's required directive/document marker.
+# Normalize them after every render before running suricata -T.
+run_logged ensure_suricata_yaml_header "$SURICATA_CONFIG"
+[ "$(sed -n '1p' "$SURICATA_CONFIG")" = "%YAML 1.1" ] || \
+    die "Suricata YAML header repair failed: first line is invalid"
+[ "$(sed -n '2p' "$SURICATA_CONFIG")" = "---" ] || \
+    die "Suricata YAML header repair failed: second line is invalid"
 
 : >/dev/shm/ezhik-suricata-fast.log
 chmod 600 /dev/shm/ezhik-suricata-fast.log || true
