@@ -11,6 +11,8 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 APP_VERSION="$(tr -d '[:space:]' <"$REPO_DIR/VERSION")"
 ENGINE_ID="suricata-${SURICATA_VERSION}-ndpi-${NDPI_VERSION}-r${RUNTIME_REVISION}"
 RUNTIME_PREFIX="/opt/ezhik-suricata-${SURICATA_VERSION}"
+PORTABLE_CFLAGS="-O2 -pipe -march=${CPU_BASELINE} -mtune=generic"
+PORTABLE_RUSTFLAGS="-C target-cpu=${CPU_BASELINE}"
 
 OUTPUT_DIR=""
 WORK_DIR=""
@@ -126,7 +128,7 @@ python3 "$REPO_DIR/scripts/patch_ndpi_strict.py" \
 printf '[runtime] Configuring nDPI %s\n' "$NDPI_VERSION"
 (
     cd "$NDPI_SRC"
-    ./autogen.sh
+    CFLAGS="$PORTABLE_CFLAGS" ./autogen.sh
 )
 
 printf '[runtime] Building nDPI %s\n' "$NDPI_VERSION"
@@ -153,10 +155,13 @@ printf '[runtime] Configuring Suricata %s\n' "$SURICATA_VERSION"
 (
     cd "$SURI_SRC"
     CARGO_BUILD_JOBS="$BUILD_JOBS" \
+    CFLAGS="$PORTABLE_CFLAGS" \
+    RUSTFLAGS="$PORTABLE_RUSTFLAGS" \
     ./configure \
         --prefix="$RUNTIME_PREFIX" \
         --sysconfdir="$RUNTIME_PREFIX/etc" \
         --localstatedir="$RUNTIME_PREFIX/var" \
+        --disable-gccmarch-native \
         --enable-ndpi \
         --with-ndpi="$NDPI_SRC"
 )
@@ -165,6 +170,7 @@ printf '[runtime] Building Suricata %s\n' "$SURICATA_VERSION"
 (
     cd "$SURI_SRC"
     CARGO_BUILD_JOBS="$BUILD_JOBS" \
+    RUSTFLAGS="$PORTABLE_RUSTFLAGS" \
     MAKEFLAGS="-j$BUILD_JOBS" \
     nice -n 10 make -j"$BUILD_JOBS"
 )
@@ -242,6 +248,7 @@ data = {
     "os": "ubuntu",
     "os_version": "${OS_VERSION}",
     "arch": "${ARCH}",
+    "cpu_baseline": "${CPU_BASELINE}",
     "suricata_version": "${SURICATA_VERSION}",
     "ndpi_version": "${NDPI_VERSION}",
     "patchset_sha256": "${PATCHSET_SHA}",

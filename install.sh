@@ -875,6 +875,7 @@ else
         --engine-id "$ENGINE_ID" \
         --os-version "$OS_VERSION_ID" \
         --arch amd64 \
+        --cpu-baseline "$CPU_BASELINE" \
         --runtime-prefix "$SURICATA_PREFIX"
 
     mapfile -t RUNTIME_PACKAGES < <(

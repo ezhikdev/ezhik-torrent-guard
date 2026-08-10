@@ -22,6 +22,7 @@ def main():
     parser.add_argument("--engine-id", required=True)
     parser.add_argument("--os-version", required=True)
     parser.add_argument("--arch", required=True)
+    parser.add_argument("--cpu-baseline", required=True)
     parser.add_argument("--runtime-prefix", required=True)
     args = parser.parse_args()
 
@@ -35,6 +36,7 @@ def main():
         "os": "ubuntu",
         "os_version": args.os_version,
         "arch": args.arch,
+        "cpu_baseline": args.cpu_baseline,
         "runtime_prefix": args.runtime_prefix,
     }
     for key, value in expected.items():
