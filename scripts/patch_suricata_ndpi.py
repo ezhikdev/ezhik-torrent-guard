@@ -7,17 +7,44 @@ if len(sys.argv) != 2:
 
 p = Path(sys.argv[1])
 s = p.read_text()
-marker = "EZHIK: conservative DPI settings"
+marker = "EZHIK: BitTorrent-only DPI settings"
 
 if marker in s:
-    print("Suricata nDPI conservative settings already present")
+    print("Suricata nDPI BitTorrent-only settings already present")
     raise SystemExit(0)
 
-needle = "    ndpi_set_protocol_detection_bitmask2(context->ndpi, &protos);\n"
-if s.count(needle) != 1:
-    raise SystemExit("could not find unique nDPI initialization anchor")
+stock_mask = '''    NDPI_PROTOCOL_BITMASK protos;
+    NDPI_BITMASK_SET_ALL(protos);
+    ndpi_set_protocol_detection_bitmask2(context->ndpi, &protos);
+'''
+restricted_mask = '''    NDPI_PROTOCOL_BITMASK protos;
+    NDPI_BITMASK_RESET(protos);
+    NDPI_BITMASK_ADD(protos, NDPI_PROTOCOL_BITTORRENT);
+    ndpi_set_protocol_detection_bitmask2(context->ndpi, &protos);
+'''
 
-block = needle + '''\n    /* EZHIK: conservative DPI settings */\n    if (ndpi_set_config(context->ndpi, NULL, "fpc", "disable") != NDPI_CFG_OK)\n        FatalError("nDPI: failed to disable FPC");\n\n    if (ndpi_set_config(context->ndpi, NULL, "lru.bittorrent.size", "0") != NDPI_CFG_OK)\n        FatalError("nDPI: failed to disable BitTorrent LRU");\n\n    if (ndpi_set_config(context->ndpi, NULL, "dpi.guess_on_giveup", "0") != NDPI_CFG_OK)\n        FatalError("nDPI: failed to disable protocol guessing");\n'''
+if s.count(stock_mask) != 1:
+    raise SystemExit("could not find unique nDPI protocol-mask anchor")
 
-p.write_text(s.replace(needle, block, 1))
-print("Suricata nDPI conservative settings applied")
+s = s.replace(stock_mask, restricted_mask, 1)
+
+old_marker = "EZHIK: conservative DPI settings"
+if old_marker in s:
+    s = s.replace(old_marker, marker, 1)
+else:
+    needle = "    ndpi_set_protocol_detection_bitmask2(context->ndpi, &protos);\n"
+    block = needle + '''
+    /* EZHIK: BitTorrent-only DPI settings */
+    if (ndpi_set_config(context->ndpi, NULL, "fpc", "disable") != NDPI_CFG_OK)
+        FatalError("nDPI: failed to disable FPC");
+
+    if (ndpi_set_config(context->ndpi, NULL, "lru.bittorrent.size", "0") != NDPI_CFG_OK)
+        FatalError("nDPI: failed to disable BitTorrent LRU");
+
+    if (ndpi_set_config(context->ndpi, NULL, "dpi.guess_on_giveup", "0") != NDPI_CFG_OK)
+        FatalError("nDPI: failed to disable protocol guessing");
+'''
+    s = s.replace(needle, block, 1)
+
+p.write_text(s)
+print("Suricata nDPI BitTorrent-only settings applied")

@@ -11,6 +11,7 @@ import subprocess
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict, deque
+from functools import lru_cache
 
 import remnawave_actions as remna_actions
 
@@ -47,6 +48,8 @@ INFO_LOG = "/dev/shm/xray-info.log"
 SURI_LOG = "/dev/shm/ezhik-suricata-fast.log"
 
 BT_SID = "9900010"
+BT_ALERT_MARKER = f"[1:{BT_SID}:"
+BT_ALERT_MARKER_BYTES = BT_ALERT_MARKER.encode("ascii")
 
 DRY_RUN = _env_bool("EZHIK_DRY_RUN", False)
 PROTECTED_CLIENTS = _env_clients("EZHIK_PROTECTED_CLIENTS")
@@ -58,6 +61,7 @@ WINDOW = 300
 # First exact strict-nDPI BitTorrent socket triggers the policy.
 # The cooldown follows the configured freeze duration.
 FREEZE_SECONDS = _env_int("EZHIK_FREEZE_SECONDS", 900)
+STATS_INTERVAL = _env_int("EZHIK_STATS_INTERVAL", 60)
 
 # access ↔ request-id correlation
 ACCESS_TTL = 3.0
@@ -107,9 +111,6 @@ suri_re = re.compile(
     r'(\d+\.\d+\.\d+\.\d+):(\d+)'
 )
 
-TS_FMT = "%Y/%m/%d %H:%M:%S.%f"
-
-
 # ============================================================
 # STATE — RAM ONLY
 # ============================================================
@@ -117,30 +118,37 @@ TS_FMT = "%Y/%m/%d %H:%M:%S.%f"
 # (proto, logical destination)
 # -> deque[(timestamp, email)]
 access_by_dest = defaultdict(deque)
+access_expiry = deque()
 
 # request-id -> request information
 requests = {}
+request_expiry = deque()
 
 # (proto, logical destination) -> set(request-id)
 requests_by_dest = defaultdict(set)
 
 # request-id -> outbound socket info
 opened = {}
+opened_expiry = deque()
 
 # Exact Xray socket ->
 # deque[(timestamp, email)]
 socket_owners = defaultdict(deque)
+socket_expiry = deque()
 
 # nDPI alert, который ещё ждёт ownership.
 # socket -> timestamp
 pending_bt = {}
+pending_bt_expiry = deque()
 
 # client ->
 # exact socket -> timestamp
 hits = defaultdict(dict)
+hits_expiry = deque()
 
 # client -> timestamp last WOULD_FREEZE
 announced = {}
+announced_expiry = deque()
 
 stats = {
     "access": 0,
@@ -156,6 +164,9 @@ stats = {
 
     "ambiguous_request": 0,
     "ambiguous_socket": 0,
+    "filtered_info": 0,
+    "filtered_access": 0,
+    "queue_dropped": 0,
 }
 
 events = queue.Queue(maxsize=100000)
@@ -172,26 +183,67 @@ def stop(*_):
     running = False
 
 
-signal.signal(signal.SIGINT, stop)
-signal.signal(signal.SIGTERM, stop)
-
-if not LOCAL_IP:
-    raise RuntimeError("EZHIK_LOCAL_IP is not configured")
-
-
 # ============================================================
 # HELPERS
 # ============================================================
 
+@lru_cache(maxsize=8)
+def _log_second_timestamp(value):
+    return datetime.strptime(
+        value,
+        "%Y/%m/%d %H:%M:%S",
+    ).timestamp()
+
+
 def log_timestamp(line):
     try:
-        return datetime.strptime(
-            line[:26],
-            TS_FMT,
-        ).timestamp()
+        stamp = line[:26]
+
+        if (
+            len(stamp) != 26
+            or stamp[19] != "."
+            or not stamp[20:].isdigit()
+        ):
+            return None
+
+        return (
+            _log_second_timestamp(stamp[:19])
+            + int(stamp[20:]) / 1_000_000
+        )
 
     except Exception:
         return None
+
+
+def relevant_line(name, line):
+    if isinstance(line, bytes):
+        if name == "info":
+            return (
+                b"received request for " in line
+                or b"connection opened to " in line
+            )
+
+        if name == "access":
+            return b"accepted " in line
+
+        if name == "suricata":
+            return BT_ALERT_MARKER_BYTES in line
+
+        return True
+
+    if name == "info":
+        return (
+            "received request for " in line
+            or "connection opened to " in line
+        )
+
+    if name == "access":
+        return "accepted " in line
+
+    if name == "suricata":
+        return BT_ALERT_MARKER in line
+
+    return True
 
 
 def reader(name, cmd):
@@ -200,14 +252,22 @@ def reader(name, cmd):
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
-            bufsize=1,
+            text=False,
         )
 
         for line in proc.stdout:
 
             if not running:
                 break
+
+            if not relevant_line(name, line):
+                if name == "info":
+                    stats["filtered_info"] += 1
+                elif name == "access":
+                    stats["filtered_access"] += 1
+                continue
+
+            line = line.decode("utf-8", errors="replace")
 
             try:
                 events.put(
@@ -216,7 +276,7 @@ def reader(name, cmd):
                 )
 
             except queue.Full:
-                pass
+                stats["queue_dropped"] += 1
 
         try:
             proc.terminate()
@@ -320,11 +380,17 @@ def bind_socket(rid):
     )
 
     now = time.time()
+    owner_record = (
+        now,
+        email,
+    )
 
-    socket_owners[key].append(
+    socket_owners[key].append(owner_record)
+    socket_expiry.append(
         (
-            now,
-            email,
+            now + SOCKET_TTL,
+            key,
+            owner_record,
         )
     )
 
@@ -445,16 +511,17 @@ def process_access(line):
             email,
         )
     )
+    access_expiry.append(
+        (
+            ts + ACCESS_TTL,
+            key,
+        )
+    )
 
     stats["access"] += 1
 
     # received request мог появиться чуть раньше access.
-    for rid in list(
-        requests_by_dest.get(
-            key,
-            set(),
-        )
-    ):
+    for rid in requests_by_dest.get(key, ()):
         try_map_request(rid)
 
 
@@ -471,7 +538,11 @@ def process_info(line):
     # received request
     # --------------------------------------------------------
 
-    m = recv_re.search(line)
+    m = (
+        recv_re.search(line)
+        if "received request for " in line
+        else None
+    )
 
     if m:
 
@@ -479,11 +550,13 @@ def process_info(line):
 
         proto = proto.lower()
 
+        created = time.time()
+
         requests[rid] = {
             "ts": ts,
             "proto": proto,
             "dest": dest,
-            "created": time.time(),
+            "created": created,
             "email": None,
 
             # V2 dedup.
@@ -497,6 +570,13 @@ def process_info(line):
                 dest,
             )
         ].add(rid)
+        request_expiry.append(
+            (
+                created + REQUEST_TTL,
+                rid,
+                created,
+            )
+        )
 
         stats["requests"] += 1
 
@@ -508,7 +588,11 @@ def process_info(line):
     # connection opened
     # --------------------------------------------------------
 
-    m = open_re.search(line)
+    m = (
+        open_re.search(line)
+        if "connection opened to " in line
+        else None
+    )
 
     if not m:
         return
@@ -534,13 +618,22 @@ def process_info(line):
         port_match.group(1)
     )
 
+    created = time.time()
+
     opened[rid] = {
-        "created": time.time(),
+        "created": created,
         "proto": proto.lower(),
         "local_port": local_port,
         "remote_ip": remote_ip,
         "remote_port": int(remote_port),
     }
+    opened_expiry.append(
+        (
+            created + REQUEST_TTL,
+            rid,
+            created,
+        )
+    )
 
     stats["opened"] += 1
 
@@ -620,10 +713,26 @@ def add_hit(client, key):
     if key in client_hits:
 
         client_hits[key] = now
+        hits_expiry.append(
+            (
+                now + WINDOW,
+                client,
+                key,
+                now,
+            )
+        )
 
         return False
 
     client_hits[key] = now
+    hits_expiry.append(
+        (
+            now + WINDOW,
+            client,
+            key,
+            now,
+        )
+    )
 
     (
         exact_sockets,
@@ -678,6 +787,13 @@ def add_hit(client, key):
         return True
 
     announced[client] = now
+    announced_expiry.append(
+        (
+            now + FREEZE_SECONDS,
+            client,
+            now,
+        )
+    )
 
     if DRY_RUN:
 
@@ -720,6 +836,7 @@ def attribute_bt(key):
         dq.popleft()
 
     if not dq:
+        socket_owners.pop(key, None)
         return False
 
     users = {
@@ -797,7 +914,15 @@ def process_suricata(line):
     if attribute_bt(key):
         return
 
-    pending_bt[key] = time.time()
+    pending_ts = time.time()
+    pending_bt[key] = pending_ts
+    pending_bt_expiry.append(
+        (
+            pending_ts + PENDING_BT_TTL,
+            key,
+            pending_ts,
+        )
+    )
 
 
 # ============================================================
@@ -812,37 +937,32 @@ def cleanup():
     # Access events
     # --------------------------------------------------------
 
-    for key in list(
-        access_by_dest
-    ):
+    while access_expiry and access_expiry[0][0] < now:
+        _expires, key = access_expiry.popleft()
+        dq = access_by_dest.get(key)
 
-        dq = access_by_dest[key]
+        if dq is None:
+            continue
 
-        while dq and (
-            now - dq[0][0] > ACCESS_TTL
-        ):
+        if not dq:
+            access_by_dest.pop(key, None)
+            continue
+
+        while dq and now - dq[0][0] > ACCESS_TTL:
             dq.popleft()
 
         if not dq:
-            access_by_dest.pop(
-                key,
-                None,
-            )
+            access_by_dest.pop(key, None)
 
     # --------------------------------------------------------
     # Requests
     # --------------------------------------------------------
 
-    for rid in list(
-        requests
-    ):
+    while request_expiry and request_expiry[0][0] < now:
+        _expires, rid, created = request_expiry.popleft()
+        req = requests.get(rid)
 
-        req = requests[rid]
-
-        if (
-            now - req["created"]
-            <= REQUEST_TTL
-        ):
+        if not req or req["created"] != created:
             continue
 
         key = (
@@ -850,119 +970,85 @@ def cleanup():
             req["dest"],
         )
 
-        requests_by_dest[
-            key
-        ].discard(rid)
+        dest_requests = requests_by_dest.get(key)
 
-        if not requests_by_dest[key]:
+        if dest_requests is not None:
+            dest_requests.discard(rid)
 
-            requests_by_dest.pop(
-                key,
-                None,
-            )
+            if not dest_requests:
+                requests_by_dest.pop(key, None)
 
-        requests.pop(
-            rid,
-            None,
-        )
-
-        opened.pop(
-            rid,
-            None,
-        )
+        requests.pop(rid, None)
+        opened.pop(rid, None)
 
     # --------------------------------------------------------
     # Orphan opens
     # --------------------------------------------------------
 
-    for rid in list(
-        opened
-    ):
-
-        if rid in requests:
-            continue
+    while opened_expiry and opened_expiry[0][0] < now:
+        _expires, rid, created = opened_expiry.popleft()
+        op = opened.get(rid)
 
         if (
-            now - opened[rid]["created"]
-            > REQUEST_TTL
+            op
+            and op["created"] == created
+            and rid not in requests
         ):
-
-            opened.pop(
-                rid,
-                None,
-            )
+            opened.pop(rid, None)
 
     # --------------------------------------------------------
     # Socket ownership TTL
     # --------------------------------------------------------
 
-    for key in list(
-        socket_owners
-    ):
+    while socket_expiry and socket_expiry[0][0] < now:
+        _expires, key, record = socket_expiry.popleft()
+        dq = socket_owners.get(key)
 
-        dq = socket_owners[key]
+        if dq is None:
+            continue
 
-        while dq and (
-            now - dq[0][0]
-            > SOCKET_TTL
-        ):
+        if not dq:
+            socket_owners.pop(key, None)
+            continue
+
+        if dq[0] == record:
             dq.popleft()
 
         if not dq:
-
-            socket_owners.pop(
-                key,
-                None,
-            )
+            socket_owners.pop(key, None)
 
     # --------------------------------------------------------
     # Pending BT alerts
     # --------------------------------------------------------
 
-    for key in list(
-        pending_bt
-    ):
+    while pending_bt_expiry and pending_bt_expiry[0][0] < now:
+        _expires, key, pending_ts = pending_bt_expiry.popleft()
 
-        if (
-            now - pending_bt[key]
-            > PENDING_BT_TTL
-        ):
-
-            pending_bt.pop(
-                key,
-                None,
-            )
+        if pending_bt.get(key) == pending_ts:
+            pending_bt.pop(key, None)
 
     # --------------------------------------------------------
     # Evidence window
     # --------------------------------------------------------
 
-    for client in list(
-        hits
-    ):
-
-        client_hits = hits[client]
-
-        for key in list(
-            client_hits
-        ):
-
-            if (
-                now - client_hits[key]
-                > WINDOW
-            ):
-
-                client_hits.pop(
-                    key,
-                    None,
-                )
+    while hits_expiry and hits_expiry[0][0] < now:
+        _expires, client, key, hit_ts = hits_expiry.popleft()
+        client_hits = hits.get(client)
 
         if not client_hits:
+            continue
 
-            hits.pop(
-                client,
-                None,
-            )
+        if client_hits.get(key) == hit_ts:
+            client_hits.pop(key, None)
+
+        if not client_hits:
+            hits.pop(client, None)
+
+    while announced_expiry and announced_expiry[0][0] < now:
+        _expires, client, announced_ts = announced_expiry.popleft()
+
+        if announced.get(client) == announced_ts:
+            announced.pop(client, None)
 
 
 # ============================================================
@@ -1029,6 +1115,9 @@ def print_stats():
         f"pending={len(pending_bt)} "
         f"amb_req={stats['ambiguous_request']} "
         f"amb_sock={stats['ambiguous_socket']} "
+        f"filtered_info={stats['filtered_info']} "
+        f"filtered_access={stats['filtered_access']} "
+        f"dropped={stats['queue_dropped']} "
         f"queue={events.qsize()}",
         flush=True,
     )
@@ -1038,89 +1127,81 @@ def print_stats():
 # MAIN
 # ============================================================
 
-print("================================================")
-print(" EZHIK TORRENT GUARD v1.0.0")
-print(" MODE: " + ("DRY RUN" if DRY_RUN else "LIVE REMNAWAVE"))
-print()
-print(" Exact Xray socket <-> strict nDPI attribution")
-print()
-print(
-    " Trigger: FIRST exact strict-nDPI BitTorrent socket"
-)
-print()
-print(
-    " NO REMNAWAVE ACTIONS WILL BE SENT"
-    if DRY_RUN
-    else
-    " REMNAWAVE ACTIONS ENABLED"
-)
-print(" Developer: ezhikdev | Telegram: @ezhikdev")
-print(" GitHub: https://github.com/ezhikdev")
-print("================================================")
-print()
+def main():
+    if not LOCAL_IP:
+        raise RuntimeError("EZHIK_LOCAL_IP is not configured")
 
-if not DRY_RUN:
-    remna_actions.start()
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
 
-start_readers()
-
-last_cleanup = time.time()
-last_stats = time.time()
-
-try:
-
-    while running:
-
-        try:
-
-            source, line = events.get(
-                timeout=0.5
-            )
-
-            if source == "access":
-
-                process_access(line)
-
-            elif source == "info":
-
-                process_info(line)
-
-            elif source == "suricata":
-
-                process_suricata(line)
-
-        except queue.Empty:
-
-            pass
-
-        now = time.time()
-
-        if now - last_cleanup >= 2:
-
-            cleanup()
-
-            last_cleanup = now
-
-        if now - last_stats >= _env_int("EZHIK_STATS_INTERVAL", 60):
-
-            print_stats()
-
-            last_stats = now
-
-finally:
-
+    print("================================================")
+    print(" EZHIK TORRENT GUARD v1.0.0")
+    print(" MODE: " + ("DRY RUN" if DRY_RUN else "LIVE REMNAWAVE"))
+    print()
+    print(" Exact Xray socket <-> strict nDPI attribution")
+    print()
+    print(" Trigger: FIRST exact strict-nDPI BitTorrent socket")
     print()
     print(
-        "Stopping Torrent Guard v1.0.0...",
-        flush=True,
+        " NO REMNAWAVE ACTIONS WILL BE SENT"
+        if DRY_RUN
+        else " REMNAWAVE ACTIONS ENABLED"
     )
+    print(" Developer: ezhikdev | Telegram: @ezhikdev")
+    print(" GitHub: https://github.com/ezhikdev")
+    print("================================================")
+    print()
 
     if not DRY_RUN:
-        remna_actions.stop()
+        remna_actions.start()
 
-    privacy_cleanup()
+    start_readers()
 
-    print(
-        "RAM connection logs truncated.",
-        flush=True,
-    )
+    last_cleanup = time.time()
+    last_stats = time.time()
+
+    try:
+        while running:
+            try:
+                source, line = events.get(timeout=0.5)
+
+                if source == "access":
+                    process_access(line)
+                elif source == "info":
+                    process_info(line)
+                elif source == "suricata":
+                    process_suricata(line)
+
+            except queue.Empty:
+                pass
+
+            now = time.time()
+
+            if now - last_cleanup >= 2:
+                cleanup()
+                last_cleanup = now
+
+            if now - last_stats >= STATS_INTERVAL:
+                print_stats()
+                last_stats = now
+
+    finally:
+        print()
+        print(
+            "Stopping Torrent Guard v1.0.0...",
+            flush=True,
+        )
+
+        if not DRY_RUN:
+            remna_actions.stop()
+
+        privacy_cleanup()
+
+        print(
+            "RAM connection logs truncated.",
+            flush=True,
+        )
+
+
+if __name__ == "__main__":
+    main()
