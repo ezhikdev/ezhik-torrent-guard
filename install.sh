@@ -363,9 +363,10 @@ confirm() {
     printf '%s %s: ' "$text" "$suffix" >/dev/tty
     IFS= read -r value </dev/tty || return 1
     value="${value:-$default}"
+    value="$(printf '%s' "$value" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
 
     case "$value" in
-        y|Y|yes|YES|Yes) return 0 ;;
+        y|yes) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -694,6 +695,7 @@ else
     DRY_RUN="true"
     MODE="DRY RUN"
 fi
+ok "Enforcement mode selected: $MODE"
 
 AUTH_HEADERS="$STAGE_DIR/remnawave-headers.txt"
 printf 'Authorization: Bearer %s\nAccept: application/json\n' "$API_TOKEN" >"$AUTH_HEADERS" || \
