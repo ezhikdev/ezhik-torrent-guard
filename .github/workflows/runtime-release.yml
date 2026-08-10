@@ -1,0 +1,164 @@
+name: Build runtime and release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Ubuntu ${{ matrix.os_version }} amd64
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            os_version: "22.04"
+          - runner: ubuntu-24.04
+            os_version: "24.04"
+
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify version and tag
+        shell: bash
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            test "${GITHUB_REF_NAME}" = "v${version}"
+          fi
+          test "$(. /etc/os-release; printf '%s' "$VERSION_ID")" = "${{ matrix.os_version }}"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            ca-certificates curl git autoconf automake build-essential \
+            cargo cbindgen gettext flex bison libjansson-dev libjson-c-dev \
+            libpcap-dev libpcre2-dev libtool libyaml-dev pkg-config rustc \
+            zlib1g-dev libnetfilter-queue-dev libnfnetlink-dev libcap-ng-dev \
+            libmagic-dev libnet1-dev libnuma-dev libmaxminddb-dev librrd-dev \
+            libgcrypt20-dev libgpg-error-dev libcurl4-openssl-dev python3 zstd
+
+      - name: Build packaged runtime
+        env:
+          BUILD_JOBS: "2"
+        run: |
+          chmod +x scripts/build-runtime.sh
+          scripts/build-runtime.sh --output-dir dist --jobs "$BUILD_JOBS"
+
+      - name: Upload test artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-ubuntu-${{ matrix.os_version }}-amd64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  verify:
+    name: Verify Ubuntu ${{ matrix.os_version }} package
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            os_version: "22.04"
+          - runner: ubuntu-24.04
+            os_version: "24.04"
+
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime-ubuntu-${{ matrix.os_version }}-amd64
+          path: dist
+
+      - name: Verify archive and runtime dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y python3 zstd
+          (cd dist && sha256sum -c *.sha256)
+          mkdir runtime
+          tar --zstd -xf dist/*.tar.zst -C runtime
+          mapfile -t packages < <(
+            python3 - <<'PY'
+          import json
+          for package in json.load(open("runtime/runtime-manifest.json"))["runtime_packages"]:
+              print(package)
+          PY
+          )
+          test "${#packages[@]}" -gt 0
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+          engine_id="$(
+            . RUNTIME.env
+            printf 'suricata-%s-ndpi-%s-r%s' \
+              "$SURICATA_VERSION" "$NDPI_VERSION" "$RUNTIME_REVISION"
+          )"
+          version="$(tr -d '[:space:]' < VERSION)"
+          runtime_prefix="/opt/ezhik-suricata-$(. RUNTIME.env; printf '%s' "$SURICATA_VERSION")"
+          python3 scripts/verify-runtime.py runtime \
+            --app-version "$version" \
+            --engine-id "$engine_id" \
+            --os-version "${{ matrix.os_version }}" \
+            --arch amd64 \
+            --runtime-prefix "$runtime_prefix"
+          prefix="runtime${runtime_prefix}"
+          ! ldd "$prefix/bin/suricata" | grep -q 'not found'
+          ! ldd "$prefix/lib/ezhik/ndpi.so" | grep -q 'not found'
+          "$prefix/bin/suricata" --build-info
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: runtime-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create release manifest
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          python3 scripts/create-release-manifest.py \
+            --dist dist \
+            --version "$version" \
+            --output dist/release-manifest.json
+          (cd dist && sha256sum release-manifest.json > release-manifest.json.sha256)
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --verify-tag \
+              --generate-notes \
+              --title "Ezhik Torrent Guard $GITHUB_REF_NAME"
+          fi
