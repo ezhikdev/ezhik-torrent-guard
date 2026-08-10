@@ -95,7 +95,9 @@ if isinstance(logging, dict):
             if "console" in item and isinstance(item["console"], dict):
                 item["console"]["enabled"] = True
 
+rendered = yaml.safe_dump(cfg, sort_keys=False, default_flow_style=False)
 with config_path.open("w", encoding="utf-8") as f:
-    yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
+    f.write("%YAML 1.1\n---\n")
+    f.write(rendered)
 
 print(f"Suricata config rendered for {wan_if} / {wan_ip}")

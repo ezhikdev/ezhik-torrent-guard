@@ -895,12 +895,27 @@ PY_PACKAGES
     STAGED_BIN="$STAGED_PREFIX/bin/suricata"
     STAGED_CONFIG="$STAGED_PREFIX/etc/suricata/suricata.yaml"
     STAGED_PLUGIN="$STAGED_PREFIX/lib/ezhik/ndpi.so"
+    STAGED_CLASSIFICATION="$STAGED_PREFIX/etc/suricata/classification.config"
+    STAGED_REFERENCE="$STAGED_PREFIX/etc/suricata/reference.config"
+    STAGED_THRESHOLD="$STAGED_PREFIX/etc/suricata/threshold.config"
+
+    [ -f "$STAGED_CLASSIFICATION" ] || \
+        die "Staged classification.config is missing"
+    [ -f "$STAGED_REFERENCE" ] || die "Staged reference.config is missing"
 
     run_logged python3 "$STAGE_DIR/scripts/render_suricata_config.py" \
         "$STAGED_CONFIG" "$WAN_IF" "$WAN_IP" "$STAGED_PLUGIN"
     run_logged ensure_suricata_yaml_header "$STAGED_CONFIG"
-    "$STAGED_BIN" -T -c "$STAGED_CONFIG" \
-        -S "$STAGE_DIR/suricata/ezhik-torrent-only.rules" \
+    STAGED_TEST_ARGS=(
+        -T -c "$STAGED_CONFIG"
+        -S "$STAGE_DIR/suricata/ezhik-torrent-only.rules"
+        --set "classification-file=$STAGED_CLASSIFICATION"
+        --set "reference-config-file=$STAGED_REFERENCE"
+    )
+    if [ -f "$STAGED_THRESHOLD" ]; then
+        STAGED_TEST_ARGS+=(--set "threshold-file=$STAGED_THRESHOLD")
+    fi
+    "$STAGED_BIN" "${STAGED_TEST_ARGS[@]}" \
         >>"$INSTALL_LOG" 2>&1 || die "Staged Suricata runtime validation failed"
 
     progress_done 85 "Runtime ready ($RUNTIME_SOURCE)"
