@@ -32,7 +32,7 @@ Client → Xray / RemnaNode → Internet
 
 Guard **не банит source IP** и не использует общий IP ingress для определения пользователя.
 
-## Особенности v1.0.2
+## Особенности v1.1.0
 
 - пассивный `AF_PACKET`, без inline/NFQUEUE;
 - не добавляет правила `iptables`;
@@ -48,7 +48,7 @@ Guard **не банит source IP** и не использует общий IP i
 - Suricata EVE и PCAP logging отключаются;
 - защита от накопления stale `tail` readers после restart Guard.
 
-> **Ограничение v1.0.2:** детектор настроен на IPv4. IPv6 — отдельная будущая задача.
+> **Ограничение v1.1.0:** детектор настроен на IPv4. IPv6 — отдельная будущая задача.
 
 ## Оптимизация runtime
 
@@ -150,8 +150,8 @@ Workflow `.github/workflows/runtime-release.yml` собирает отдельн
 Для публикации:
 
 ```bash
-git tag v1.0.2
-git push origin v1.0.2
+git tag v1.1.0
+git push origin v1.1.0
 ```
 
 Значение тега должно точно соответствовать корневому `VERSION` с префиксом `v`. После успешных build/verify jobs workflow создаст GitHub Release и приложит оба runtime-пакета, SHA-256 и manifests. Для следующего релиза сначала измените `VERSION`, например на `1.0.3`, затем создайте тег `v1.0.3`.

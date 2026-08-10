@@ -206,17 +206,29 @@ PATCHSET_SHA="$({
 SURICATA_SHA="$(sha256sum "$STAGED_BIN" | awk '{print $1}')"
 PLUGIN_SHA="$(sha256sum "$PLUGIN_PATH" | awk '{print $1}')"
 MANIFEST="$PACKAGE_ROOT/runtime-manifest.json"
-RUNTIME_PACKAGES="$({
+mapfile -t RUNTIME_PACKAGE_LIST < <({
     ldd "$STAGED_BIN"
     ldd "$PLUGIN_PATH"
 } | awk '
     /=> \// { print $3 }
     /^\// { print $1 }
 ' | while IFS= read -r library; do
-    owner="$(dpkg-query -S "$library" 2>/dev/null | head -n1 || true)"
+    canonical="$(readlink -f "$library" 2>/dev/null || true)"
+    owner="$(
+        dpkg-query -S "$library" ${canonical:+"$canonical"} 2>/dev/null \
+            | head -n1 || true
+    )"
     [ -n "$owner" ] || continue
-    printf '%s\n' "$owner" | sed -E 's/: \/.*$//; s/:amd64$//'
-done | sort -u | tr '\n' ' ')"
+    package="${owner%%: /*}"
+    printf '%s\n' "${package%:amd64}"
+done | sort -u)
+
+[ "${#RUNTIME_PACKAGE_LIST[@]}" -gt 0 ] || {
+    printf 'Could not determine runtime dependency packages\n' >&2
+    exit 1
+}
+RUNTIME_PACKAGES="${RUNTIME_PACKAGE_LIST[*]}"
+printf '[runtime] Dependency packages: %s\n' "$RUNTIME_PACKAGES"
 
 python3 - "$MANIFEST" <<PY
 import json
