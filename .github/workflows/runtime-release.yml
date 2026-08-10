@@ -105,7 +105,14 @@ jobs:
           PY
           )
           test "${#packages[@]}" -gt 0
-          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+          missing=()
+          for package in "${packages[@]}"; do
+            status="$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)"
+            [[ "$status" == "install ok installed" ]] || missing+=("$package")
+          done
+          if (( ${#missing[@]} > 0 )); then
+            sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
+          fi
           engine_id="$(
             . RUNTIME.env
             printf 'suricata-%s-ndpi-%s-r%s' \
@@ -113,11 +120,13 @@ jobs:
           )"
           version="$(tr -d '[:space:]' < VERSION)"
           runtime_prefix="/opt/ezhik-suricata-$(. RUNTIME.env; printf '%s' "$SURICATA_VERSION")"
+          cpu_baseline="$(. RUNTIME.env; printf '%s' "$CPU_BASELINE")"
           python3 scripts/verify-runtime.py runtime \
             --app-version "$version" \
             --engine-id "$engine_id" \
             --os-version "${{ matrix.os_version }}" \
             --arch amd64 \
+            --cpu-baseline "$cpu_baseline" \
             --runtime-prefix "$runtime_prefix"
           prefix="runtime${runtime_prefix}"
           ! ldd "$prefix/bin/suricata" | grep -q 'not found'
