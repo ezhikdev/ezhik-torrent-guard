@@ -2,9 +2,22 @@
 
 set -o pipefail
 
-APP_VERSION="1.0.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 APP_DIR="/opt/ezhik-torrent-guard"
-SURICATA_PREFIX="/opt/ezhik-suricata-8.0.6"
+APP_VERSION="unknown"
+if [ -r "$APP_DIR/VERSION" ]; then
+    APP_VERSION="$(tr -d '[:space:]' <"$APP_DIR/VERSION")"
+elif [ -r "$SCRIPT_DIR/VERSION" ]; then
+    APP_VERSION="$(tr -d '[:space:]' <"$SCRIPT_DIR/VERSION")"
+fi
+SURICATA_VERSION="8.0.6"
+if [ -r "$APP_DIR/RUNTIME.env" ]; then
+    installed_suricata="$(sed -n 's/^SURICATA_VERSION=//p' "$APP_DIR/RUNTIME.env" | tail -n1)"
+    if [[ "$installed_suricata" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        SURICATA_VERSION="$installed_suricata"
+    fi
+fi
+SURICATA_PREFIX="/opt/ezhik-suricata-$SURICATA_VERSION"
 CONFIG_DIR="/etc/ezhik-torrent-guard"
 STATE_DIR="/var/lib/ezhik-torrent-guard"
 BUILD_DIR="/opt/ezhik-torrent-guard-build"

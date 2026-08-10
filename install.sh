@@ -2,8 +2,10 @@
 
 set -o pipefail
 
-APP_VERSION="1.0.2"
+APP_VERSION=""
+REPO_SLUG="ezhikdev/ezhik-torrent-guard"
 REPO_RAW="https://raw.githubusercontent.com/ezhikdev/ezhik-torrent-guard/main"
+RELEASE_BASE="https://github.com/$REPO_SLUG/releases"
 APP_DIR="/opt/ezhik-torrent-guard"
 SURICATA_PREFIX="/opt/ezhik-suricata-8.0.6"
 CONFIG_DIR="/etc/ezhik-torrent-guard"
@@ -37,10 +39,74 @@ BANNER
 info() { printf '\033[1;34m[INFO]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ OK ]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*"; }
-die()  { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 
-INSTALL_STARTED_AT="$(date +%s)"
-SPINNER_CHARS='|/-\\'
+RUNTIME_SWAPPED=0
+RUNTIME_BACKUP=""
+SERVICES_STOPPED=0
+APP_METADATA_CHANGED=0
+APP_METADATA_BACKUP="$STAGE_DIR/app-metadata-backup"
+
+backup_app_metadata() {
+    local name
+
+    mkdir -p "$APP_METADATA_BACKUP" || die "Cannot prepare application metadata backup"
+    for name in VERSION RUNTIME.env install-manifest.json; do
+        if [ -f "$APP_DIR/$name" ]; then
+            cp -p "$APP_DIR/$name" "$APP_METADATA_BACKUP/$name" || \
+                die "Cannot preserve $name before update"
+        else
+            : >"$APP_METADATA_BACKUP/$name.missing"
+        fi
+    done
+    APP_METADATA_CHANGED=1
+}
+
+restore_app_metadata() {
+    local name
+
+    [ "$APP_METADATA_CHANGED" -eq 1 ] || return 0
+    for name in VERSION RUNTIME.env install-manifest.json; do
+        if [ -f "$APP_METADATA_BACKUP/$name" ]; then
+            cp -p "$APP_METADATA_BACKUP/$name" "$APP_DIR/$name" || true
+        elif [ -f "$APP_METADATA_BACKUP/$name.missing" ]; then
+            rm -f "$APP_DIR/$name"
+        fi
+    done
+    APP_METADATA_CHANGED=0
+}
+
+rollback_runtime() {
+    if [ "$RUNTIME_SWAPPED" -eq 1 ] && [ -n "$RUNTIME_BACKUP" ]; then
+        warn "Restoring the previous Suricata runtime..."
+        systemctl stop ezhik-suricata.service ezhik-torrent-guard.service \
+            >/dev/null 2>&1 || true
+        rm -rf "$SURICATA_PREFIX"
+        if [ -d "$RUNTIME_BACKUP" ]; then
+            mv "$RUNTIME_BACKUP" "$SURICATA_PREFIX" || true
+        fi
+        RUNTIME_SWAPPED=0
+    fi
+
+    restore_app_metadata
+
+    if [ "$SERVICES_STOPPED" -eq 1 ]; then
+        systemctl start ezhik-suricata.service ezhik-ram-log-guard.service \
+            ezhik-torrent-guard.service >/dev/null 2>&1 || true
+        SERVICES_STOPPED=0
+    fi
+}
+
+die() {
+    rollback_runtime
+    printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2
+    exit 1
+}
+
+SPINNER_CHARS="|/-\\"
+UI_DYNAMIC=0
+if [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ]; then
+    UI_DYNAMIC=1
+fi
 
 format_elapsed() {
     local seconds="$1"
@@ -52,16 +118,32 @@ ui_line() {
     printf '%b' "$*" 2>/dev/null || true
 }
 
+progress_bar() {
+    local pct="$1"
+    local width=20 filled empty bar_fill bar_empty
+
+    filled=$((pct * width / 100))
+    empty=$((width - filled))
+    printf -v bar_fill '%*s' "$filled" ''
+    printf -v bar_empty '%*s' "$empty" ''
+    printf '%s%s' "${bar_fill// /#}" "${bar_empty// /-}"
+}
+
 progress_status() {
     local pct="$1"
     shift
-    ui_line "\\r\\033[2K\\033[1;36m[$(printf '%3d' "$pct")%]\\033[0m $*"
+    [ "$UI_DYNAMIC" -eq 1 ] || return 0
+    ui_line "\\r\\033[2K\\033[1;36m[$(progress_bar "$pct")]\\033[0m $(printf '%3d' "$pct")%  $*"
 }
 
 progress_done() {
     local pct="$1"
     shift
-    ui_line "\\r\\033[2K\\033[1;36m[$(printf '%3d' "$pct")%]\\033[0m $* \\033[1;32mOK\\033[0m\\n"
+    if [ "$UI_DYNAMIC" -eq 1 ]; then
+        ui_line "\\r\\033[2K\\033[1;36m[$(progress_bar "$pct")]\\033[0m $(printf '%3d' "$pct")%  $* \\033[1;32mOK\\033[0m\\n"
+    else
+        printf '[%3d%%] %s OK\n' "$pct" "$*"
+    fi
 }
 
 run_timed_logged() {
@@ -110,7 +192,7 @@ download_with_progress() {
 
     rm -f "$dest"
 
-    # Пытаемся узнать размер файла заранее.
+    # Try to discover the archive size before downloading it.
     total="$(
         curl -fsSIL --retry 2 --connect-timeout 15 "$url" 2>>"$INSTALL_LOG" |
         awk '
@@ -126,7 +208,7 @@ download_with_progress() {
 
     started="$(date +%s)"
 
-    # Сам curl работает тихо в фоне.
+    # Run curl quietly in the background while the UI tracks the file size.
     curl -fL \
         --retry 3 \
         --connect-timeout 15 \
@@ -187,36 +269,6 @@ download_with_progress() {
     progress_done "$pct" "$label"
 }
 
-count_ndpi_work() {
-    local root="$1"
-    find "$root/src" "$root/example" -type f \
-        \( -name '*.o' -o -name '*.lo' \) 2>/dev/null | wc -l
-}
-
-count_ndpi_total() {
-    local root="$1"
-    find "$root/src" "$root/example" -type f \
-        \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' \) 2>/dev/null | wc -l
-}
-
-count_suricata_work() {
-    local root="$1"
-    local c rust
-    c="$(find "$root/src" "$root/plugins" -type f \
-        \( -name '*.o' -o -name '*.lo' \) 2>/dev/null | wc -l)"
-    rust="$(find "$root/rust/target/release/deps" -maxdepth 1 -type f \
-        \( -name '*.rlib' -o -name '*.so' \) 2>/dev/null | wc -l)"
-    printf '%d' $((c + rust))
-}
-
-count_suricata_total() {
-    local root="$1"
-    local c rust
-    c="$(find "$root/src" "$root/plugins" -type f -name '*.c' 2>/dev/null | wc -l)"
-    rust="$(grep -c '^\[\[package\]\]' "$root/rust/Cargo.lock" 2>/dev/null || true)"
-    printf '%d' $((c + rust))
-}
-
 latest_build_activity() {
     tail -n 120 "$INSTALL_LOG" 2>/dev/null | \
         grep -E '(^|[[:space:]])(CC|CXX|CCLD|AR|LD)[[:space:]]|Compiling |Building |Linking |Finished ' | \
@@ -227,44 +279,24 @@ run_build_progress() {
     local overall_start="$1"
     local overall_end="$2"
     local label="$3"
-    local kind="$4"
-    local root="$5"
-    shift 5
+    shift 3
 
-    local started now elapsed frame=0 pid rc total done sub overall activity spin
-
-    case "$kind" in
-        ndpi) total="$(count_ndpi_total "$root")" ;;
-        suricata) total="$(count_suricata_total "$root")" ;;
-        *) total=0 ;;
-    esac
-    [ "${total:-0}" -gt 0 ] || total=1
+    local started now elapsed frame=0 pid rc activity spin
 
     started="$(date +%s)"
     "$@" >>"$INSTALL_LOG" 2>&1 &
     pid=$!
 
     while kill -0 "$pid" 2>/dev/null; do
-        case "$kind" in
-            ndpi) done="$(count_ndpi_work "$root")" ;;
-            suricata) done="$(count_suricata_work "$root")" ;;
-            *) done=0 ;;
-        esac
-
-        sub=$((done * 100 / total))
-        [ "$sub" -lt 0 ] && sub=0
-        [ "$sub" -gt 98 ] && sub=98
-        overall=$((overall_start + (overall_end - overall_start) * sub / 100))
-
         now="$(date +%s)"
         elapsed=$((now - started))
         spin="${SPINNER_CHARS:$((frame % 4)):1}"
         activity="$(latest_build_activity)"
         [ -n "$activity" ] || activity="compiler active"
 
-        progress_status "$overall" "$label  $spin  build ~$(printf '%2d' "$sub")%  $(format_elapsed "$elapsed")  $activity"
+        progress_status "$overall_start" "$label  $spin  elapsed $(format_elapsed "$elapsed")  $activity"
         frame=$((frame + 1))
-        sleep 1
+        sleep 2
     done
 
     wait "$pid"
@@ -305,13 +337,19 @@ prompt() {
     printf '%s' "$value"
 }
 
-prompt_secret() {
+prompt_secret_existing() {
     local text="$1"
+    local existing="$2"
     local value
 
-    printf '%s: ' "$text" >/dev/tty
+    if [ -n "$existing" ]; then
+        printf '%s [press Enter to keep current token]: ' "$text" >/dev/tty
+    else
+        printf '%s: ' "$text" >/dev/tty
+    fi
     IFS= read -r -s value </dev/tty || die "Cannot read secret from /dev/tty"
     printf '\n' >/dev/tty
+    [ -n "$value" ] || value="$existing"
     printf '%s' "$value"
 }
 
@@ -343,6 +381,107 @@ repo_file() {
     else
         curl -fsSL "$REPO_RAW/$rel" -o "$dest" || die "Cannot download $rel from GitHub"
     fi
+}
+
+load_app_version() {
+    local value=""
+
+    if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/VERSION" ]; then
+        value="$(tr -d '[:space:]' <"$SCRIPT_DIR/VERSION")"
+    else
+        value="$(curl -fsSL "$REPO_RAW/VERSION" 2>>"$INSTALL_LOG" || true)"
+        value="$(printf '%s' "$value" | tr -d '[:space:]')"
+    fi
+
+    [[ "$value" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || \
+        die "Repository VERSION is missing or invalid: ${value:-empty}"
+    APP_VERSION="$value"
+}
+
+config_value() {
+    local file="$1"
+    local key="$2"
+
+    [ -r "$file" ] || return 0
+    sed -n "s/^${key}=//p" "$file" | tail -n1
+}
+
+installed_engine_id() {
+    local manifest="$SURICATA_PREFIX/ezhik-runtime-manifest.json"
+    [ -r "$manifest" ] || return 0
+
+    python3 - "$manifest" <<'PY_ENGINE' 2>/dev/null || true
+import json
+import sys
+
+try:
+    print(json.load(open(sys.argv[1], encoding="utf-8")).get("engine_id", ""))
+except Exception:
+    pass
+PY_ENGINE
+}
+
+archive_paths_safe() {
+    local archive="$1"
+
+    ! tar --zstd -tf "$archive" 2>/dev/null | awk '
+        /^\// { bad=1 }
+        /(^|\/)\.\.($|\/)/ { bad=1 }
+        END { exit bad ? 0 : 1 }
+    '
+}
+
+APT_UPDATED=0
+ensure_packages() {
+    local pct="$1"
+    local label="$2"
+    shift 2
+    local package status
+    local -a missing=()
+
+    for package in "$@"; do
+        status="$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)"
+        [ "$status" = "install ok installed" ] || missing+=("$package")
+    done
+
+    if [ "${#missing[@]}" -eq 0 ]; then
+        progress_done "$pct" "$label (already installed)"
+        return 0
+    fi
+
+    if [ "$APT_UPDATED" -eq 0 ]; then
+        run_timed_logged 22 "Updating apt package index" apt-get update
+        APT_UPDATED=1
+    fi
+
+    run_timed_logged "$pct" "$label" \
+        env DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
+}
+
+select_build_jobs() {
+    local mode="${EZHIK_BUILD_MODE:-balanced}"
+    local cpus
+    cpus="$(nproc 2>/dev/null || printf '2')"
+    [ "$cpus" -ge 1 ] || cpus=1
+
+    case "$mode" in
+        eco)
+            BUILD_JOBS=1
+            ;;
+        balanced)
+            BUILD_JOBS=$(((cpus + 1) / 2))
+            [ "$BUILD_JOBS" -gt 4 ] && BUILD_JOBS=4
+            ;;
+        fast)
+            BUILD_JOBS="$cpus"
+            ;;
+        *)
+            die "Invalid EZHIK_BUILD_MODE=$mode (expected eco, balanced, or fast)"
+            ;;
+    esac
+
+    [ "$BUILD_JOBS" -ge 1 ] || BUILD_JOBS=1
+    BUILD_MODE="$mode"
 }
 
 normalize_panel_url() {
@@ -435,7 +574,7 @@ mkdir -p "$(dirname "$INSTALL_LOG")" || die "Cannot create log directory"
 chmod 600 "$INSTALL_LOG" || true
 trap 'rm -rf "$STAGE_DIR"' EXIT
 
-for cmd in apt-get docker ip python3 systemctl tar; do
+for cmd in apt-get docker dpkg-query ip python3 systemctl tar; do
     command -v "$cmd" >/dev/null 2>&1 || die "Required command not found: $cmd"
 done
 
@@ -443,6 +582,34 @@ if ! command -v curl >/dev/null 2>&1; then
     info "Installing curl..."
     run_logged apt-get update
     run_logged env DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl
+fi
+
+load_app_version
+ok "Target Torrent Guard version: v$APP_VERSION"
+
+INSTALLED_VERSION=""
+if [ -r "$APP_DIR/VERSION" ]; then
+    INSTALLED_VERSION="$(tr -d '[:space:]' <"$APP_DIR/VERSION")"
+fi
+
+if [[ "$INSTALLED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    if dpkg --compare-versions "$INSTALLED_VERSION" eq "$APP_VERSION"; then
+        ok "Torrent Guard v$APP_VERSION is already installed"
+        if systemctl is-active --quiet ezhik-suricata.service 2>/dev/null && \
+           systemctl is-active --quiet ezhik-torrent-guard.service 2>/dev/null && \
+           systemctl is-active --quiet ezhik-ram-log-guard.service 2>/dev/null; then
+            confirm "Run repair/reconfiguration anyway?" N || exit 0
+        else
+            warn "One or more Torrent Guard services are unhealthy; continuing in repair mode."
+        fi
+    elif dpkg --compare-versions "$INSTALLED_VERSION" lt "$APP_VERSION"; then
+        info "Torrent Guard update available: v$INSTALLED_VERSION -> v$APP_VERSION"
+        confirm "Install this update?" Y || exit 0
+    else
+        die "Installed version v$INSTALLED_VERSION is newer than v$APP_VERSION; downgrade refused."
+    fi
+elif [ -d "$APP_DIR" ]; then
+    warn "Legacy Torrent Guard installation detected; it will be upgraded to v$APP_VERSION."
 fi
 
 [ -r /etc/os-release ] || die "Cannot detect OS."
@@ -485,22 +652,42 @@ WAN_IP="$(awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' <<<"$ROUT
 [ -n "$WAN_IP" ] || die "Could not detect WAN IPv4."
 ok "WAN: $WAN_IF / $WAN_IP"
 
+EXISTING_PANEL_URL="$(config_value "$CONFIG_DIR/api.env" REMNAWAVE_BASE_URL)"
+EXISTING_API_TOKEN="$(config_value "$CONFIG_DIR/api.env" REMNAWAVE_API_TOKEN)"
+EXISTING_PROTECTED="$(config_value "$CONFIG_DIR/settings.env" EZHIK_PROTECTED_CLIENTS)"
+EXISTING_FREEZE_SECONDS="$(config_value "$CONFIG_DIR/settings.env" EZHIK_FREEZE_SECONDS)"
+EXISTING_DRY_RUN="$(config_value "$CONFIG_DIR/settings.env" EZHIK_DRY_RUN)"
+
+FREEZE_DEFAULT=15
+if [[ "$EXISTING_FREEZE_SECONDS" =~ ^[0-9]+$ ]] && \
+   [ "$EXISTING_FREEZE_SECONDS" -ge 60 ]; then
+    FREEZE_DEFAULT=$((EXISTING_FREEZE_SECONDS / 60))
+fi
+
 printf '\n' >/dev/tty
-PANEL_URL="$(prompt 'Remnawave panel domain or URL')"
+PANEL_URL="$(prompt 'Remnawave panel domain or URL' "$EXISTING_PANEL_URL")"
 PANEL_URL="$(normalize_panel_url "$PANEL_URL")"
-API_TOKEN="$(prompt_secret 'Remnawave Panel API token (paste token only)')"
+API_TOKEN="$(prompt_secret_existing \
+    'Remnawave Panel API token (paste token only)' \
+    "$EXISTING_API_TOKEN")"
 [ -n "$API_TOKEN" ] || die "API key cannot be empty."
 
-PROTECTED_RAW="$(prompt 'Protected Remnawave client IDs, comma-separated (optional)' '')"
+PROTECTED_RAW="$(prompt \
+    'Protected Remnawave client IDs, comma-separated (optional)' \
+    "$EXISTING_PROTECTED")"
 PROTECTED_CLIENTS="$(canonical_clients "$PROTECTED_RAW")" || die "Protected IDs must be numeric and comma-separated."
 
-FREEZE_MINUTES="$(prompt 'Freeze duration in minutes' '15')"
+FREEZE_MINUTES="$(prompt 'Freeze duration in minutes' "$FREEZE_DEFAULT")"
 [[ "$FREEZE_MINUTES" =~ ^[0-9]+$ ]] || die "Freeze duration must be a number."
-[ "$FREEZE_MINUTES" -ge 1 ] && [ "$FREEZE_MINUTES" -le 1440 ] || \
+if [ "$FREEZE_MINUTES" -lt 1 ] || [ "$FREEZE_MINUTES" -gt 1440 ]; then
     die "Freeze duration must be between 1 and 1440 minutes."
+fi
 FREEZE_SECONDS=$((FREEZE_MINUTES * 60))
 
-if confirm "Enable LIVE Remnawave enforcement after install?" Y; then
+LIVE_DEFAULT=Y
+[ "$EXISTING_DRY_RUN" = "true" ] && LIVE_DEFAULT=N
+
+if confirm "Enable LIVE Remnawave enforcement after install?" "$LIVE_DEFAULT"; then
     DRY_RUN="false"
     MODE="LIVE"
 else
@@ -525,7 +712,7 @@ if [ "$HTTP_CODE" != "200" ]; then
 fi
 
 if [ "$HTTP_CODE" != "200" ]; then
-    [ "$HTTP_CODE" != "401" ] || warn 'HTTP 401: paste the Panel API token only — without "Bearer " and without REMNAWAVE_API_TOKEN='
+    [ "$HTTP_CODE" != "401" ] || warn 'HTTP 401: paste the Panel API token only - without "Bearer " and without REMNAWAVE_API_TOKEN='
     die "Remnawave API authentication failed (HTTP ${HTTP_CODE:-0})."
 fi
 ok "Remnawave API authentication successful"
@@ -566,6 +753,8 @@ fi
 
 info "Preparing Torrent Guard repository files..."
 for rel in \
+    VERSION \
+    RUNTIME.env \
     src/guard.py \
     src/remnawave_actions.py \
     suricata/ezhik-torrent-only.rules \
@@ -573,6 +762,8 @@ for rel in \
     scripts/ezhik-torrent-guard-cleanup.sh \
     scripts/patch_ndpi_strict.py \
     scripts/patch_suricata_ndpi.py \
+    scripts/build-runtime.sh \
+    scripts/verify-runtime.py \
     scripts/render_suricata_config.py \
     systemd/ezhik-torrent-guard.service \
     systemd/ezhik-ram-log-guard.service \
@@ -581,126 +772,178 @@ for rel in \
 do
     repo_file "$rel" "$STAGE_DIR/$rel"
 done
-ok "Repository files ready"
 
-info "Installing build dependencies (details: $INSTALL_LOG)..."
-run_timed_logged 22 "apt-get update" apt-get update
-run_timed_logged 30 "Installing build dependencies" env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    ca-certificates curl git \
-    autoconf automake build-essential cargo cbindgen gettext flex bison \
-    libjansson-dev libjson-c-dev libpcap-dev libpcre2-dev libtool libyaml-dev \
-    pkg-config rustc zlib1g-dev libnetfilter-queue-dev libnfnetlink-dev \
-    libcap-ng-dev libmagic-dev libnet1-dev libnuma-dev libmaxminddb-dev \
-    librrd-dev libgcrypt20-dev libgpg-error-dev libcurl4-openssl-dev \
-    python3 python3-yaml
-ok "Build dependencies installed"
+STAGED_VERSION="$(tr -d '[:space:]' <"$STAGE_DIR/VERSION")"
+[ "$STAGED_VERSION" = "$APP_VERSION" ] || \
+    die "Repository changed during installation: expected v$APP_VERSION, got v$STAGED_VERSION"
 
-if ! rust_version_ok; then
-    warn "Rust >= 1.75 is not available in the current PATH; installing a minimal Rust toolchain with rustup."
-    curl -fsSL https://sh.rustup.rs -o "$STAGE_DIR/rustup.sh" || die "Cannot download rustup"
-    run_logged sh "$STAGE_DIR/rustup.sh" -y --profile minimal
-    export PATH="/root/.cargo/bin:$PATH"
-    rust_version_ok || die "Rust >= 1.75 is still unavailable."
-fi
-ok "Rust toolchain: $(rustc --version)"
-
-# Stop only our own services on re-install. Never touch arbitrary Suricata processes.
-systemctl stop ezhik-torrent-guard.service ezhik-ram-log-guard.service ezhik-suricata.service \
-    >/dev/null 2>&1 || true
-
-NDPI_STOCK="$BUILD_DIR/nDPI-4.14"
-NDPI_STRICT="$BUILD_DIR/nDPI-4.14-strict"
-SURI_SRC="$BUILD_DIR/suricata-8.0.6"
+# shellcheck disable=SC1091
+. "$STAGE_DIR/RUNTIME.env"
+ENGINE_ID="suricata-${SURICATA_VERSION}-ndpi-${NDPI_VERSION}-r${RUNTIME_REVISION}"
+SURICATA_PREFIX="/opt/ezhik-suricata-${SURICATA_VERSION}"
 SURICATA_BIN="$SURICATA_PREFIX/bin/suricata"
 SURICATA_CONFIG="$SURICATA_PREFIX/etc/suricata/suricata.yaml"
-BUILD_READY_MARKER="$BUILD_DIR/.ezhik-runtime-ready-suricata-8.0.6-ndpi-4.14"
-PLUGIN_SRC="$SURI_SRC/plugins/ndpi/.libs/ndpi.so"
-REUSE_BUILD=0
+PLUGIN_PATH="$SURICATA_PREFIX/lib/ezhik/ndpi.so"
+ok "Repository files ready"
 
-# If a previous run finished compilation but failed later (for example during
-# config validation), reuse the verified build instead of wasting 10+ minutes.
-if [ -f "$BUILD_READY_MARKER" ] && \
-   [ -f "$NDPI_STRICT/src/lib/libndpi.a" ] && \
+BOOTSTRAP_PACKAGES=(ca-certificates curl python3 python3-yaml zstd)
+BUILD_PACKAGES=(
+    git autoconf automake build-essential cargo cbindgen gettext flex bison
+    libjansson-dev libjson-c-dev libpcap-dev libpcre2-dev libtool libyaml-dev
+    pkg-config rustc zlib1g-dev libnetfilter-queue-dev libnfnetlink-dev
+    libcap-ng-dev libmagic-dev libnet1-dev libnuma-dev libmaxminddb-dev
+    librrd-dev libgcrypt20-dev libgpg-error-dev libcurl4-openssl-dev
+)
+
+CURRENT_ENGINE="$(installed_engine_id)"
+RUNTIME_SOURCE="installed"
+RUNTIME_ROOT=""
+
+if [ "$CURRENT_ENGINE" = "$ENGINE_ID" ] && \
    [ -x "$SURICATA_BIN" ] && \
    [ -f "$SURICATA_CONFIG" ] && \
-   [ -f "$PLUGIN_SRC" ] && \
-   ! ldd "$PLUGIN_SRC" 2>/dev/null | grep -q 'not found'; then
-    REUSE_BUILD=1
-    ok "Previous completed nDPI/Suricata build detected; reusing it"
-    progress_done 85 "Reusing completed Suricata build"
-fi
-
-if [ "$REUSE_BUILD" -eq 0 ]; then
+   [ -f "$PLUGIN_PATH" ]; then
+    progress_done 85 "Reusing installed runtime $ENGINE_ID"
+else
     rm -rf "$BUILD_DIR"
-    mkdir -p "$BUILD_DIR" || die "Cannot create $BUILD_DIR"
+    mkdir -p "$BUILD_DIR/dist" "$BUILD_DIR/runtime-root" || \
+        die "Cannot prepare $BUILD_DIR"
 
-    info "Building strict nDPI 4.14..."
-    download_with_progress 34 "Downloading nDPI 4.14" \
-        "https://github.com/ntop/nDPI/archive/refs/tags/4.14.tar.gz" \
-        "$BUILD_DIR/ndpi-4.14.tar.gz"
-    run_timed_logged 36 "Extracting nDPI 4.14" tar -xzf "$BUILD_DIR/ndpi-4.14.tar.gz" -C "$BUILD_DIR"
+    ensure_packages 30 "Installing runtime tools" "${BOOTSTRAP_PACKAGES[@]}"
 
-    [ -d "$NDPI_STOCK" ] || die "Unexpected nDPI archive layout."
-    cp -a "$NDPI_STOCK" "$NDPI_STRICT" || die "Cannot create strict nDPI tree"
+    ASSET_NAME="ezhik-runtime-${APP_VERSION}-ubuntu-${OS_VERSION_ID}-amd64.tar.zst"
+    ASSET_URL="$RELEASE_BASE/download/v${APP_VERSION}/$ASSET_NAME"
+    ASSET_PATH="$BUILD_DIR/$ASSET_NAME"
+    CHECKSUM_PATH="$ASSET_PATH.sha256"
+    USE_PREBUILT=0
 
-    run_timed_logged 38 "Applying strict BitTorrent patch" python3 \
-        "$STAGE_DIR/scripts/patch_ndpi_strict.py" \
-        "$NDPI_STRICT/src/lib/protocols/bittorrent.c"
-    run_timed_logged 40 "Configuring nDPI build system" bash -lc \
-        "cd '$NDPI_STRICT' && ./autogen.sh && ./configure"
-    run_build_progress 40 50 "Building strict nDPI" ndpi "$NDPI_STRICT" \
-        bash -lc "cd '$NDPI_STRICT' && nice -n 10 make -j2"
-
-    [ -f "$NDPI_STRICT/src/lib/libndpi.a" ] || die "strict libndpi.a was not built"
-    ok "strict nDPI 4.14 built"
-
-    info "Building Suricata 8.0.6 with strict nDPI plugin..."
-    download_with_progress 54 "Downloading Suricata 8.0.6" \
-        "https://www.openinfosecfoundation.org/download/suricata-8.0.6.tar.gz" \
-        "$BUILD_DIR/suricata-8.0.6.tar.gz"
-    run_timed_logged 56 "Extracting Suricata 8.0.6" tar -xzf "$BUILD_DIR/suricata-8.0.6.tar.gz" -C "$BUILD_DIR"
-
-    [ -d "$SURI_SRC" ] || die "Unexpected Suricata archive layout."
-
-    run_timed_logged 58 "Applying Suricata nDPI patch" python3 \
-        "$STAGE_DIR/scripts/patch_suricata_ndpi.py" \
-        "$SURI_SRC/plugins/ndpi/ndpi.c"
-
-    rm -rf "$SURICATA_PREFIX"
-    run_timed_logged 60 "Configuring Suricata 8.0.6" bash -lc \
-        "cd '$SURI_SRC' && ./configure --prefix='$SURICATA_PREFIX' --sysconfdir='$SURICATA_PREFIX/etc' --localstatedir='$SURICATA_PREFIX/var' --enable-ndpi --with-ndpi='$NDPI_STRICT'"
-    run_build_progress 60 82 "Building Suricata 8.0.6" suricata "$SURI_SRC" \
-        bash -lc "cd '$SURI_SRC' && nice -n 10 make -j2"
-    run_timed_logged 85 "Installing Suricata runtime" bash -lc \
-        "cd '$SURI_SRC' && make install && make install-conf"
-
-    [ -x "$SURICATA_BIN" ] || die "Suricata binary not installed at $SURICATA_BIN"
-    [ -f "$SURICATA_CONFIG" ] || die "Suricata config not installed at $SURICATA_CONFIG"
-    [ -f "$PLUGIN_SRC" ] || die "strict Suricata nDPI plugin was not built"
-    if ldd "$PLUGIN_SRC" 2>/dev/null | grep -q 'not found'; then
-        ldd "$PLUGIN_SRC" >&2 || true
-        die "strict nDPI plugin has missing runtime libraries"
+    if [ "${EZHIK_FORCE_SOURCE:-0}" != "1" ] && \
+       { [ "$OS_VERSION_ID" = "22.04" ] || [ "$OS_VERSION_ID" = "24.04" ]; } && \
+       curl -fsIL --retry 2 --connect-timeout 10 "$ASSET_URL" \
+           >>"$INSTALL_LOG" 2>&1; then
+        USE_PREBUILT=1
     fi
 
-    # Keep this marker until the whole installer succeeds. If a later step fails,
-    # the next run can safely skip compilation. BUILD_DIR is deleted on success.
-    : >"$BUILD_READY_MARKER"
-    ok "Suricata 8.0.6 built"
+    if [ "$USE_PREBUILT" -eq 1 ]; then
+        RUNTIME_SOURCE="release-binary"
+        download_with_progress 55 "Downloading prebuilt runtime" \
+            "$ASSET_URL" "$ASSET_PATH"
+        curl -fsSL --retry 3 "$ASSET_URL.sha256" -o "$CHECKSUM_PATH" || \
+            die "Cannot download runtime checksum"
+    else
+        RUNTIME_SOURCE="source-build"
+        warn "No prebuilt runtime for Ubuntu $OS_VERSION_ID; falling back to source build."
+        ensure_packages 34 "Installing build dependencies" "${BUILD_PACKAGES[@]}"
+
+        if ! rust_version_ok; then
+            warn "Rust >= 1.75 is unavailable; installing a minimal rustup toolchain."
+            curl -fsSL https://sh.rustup.rs -o "$STAGE_DIR/rustup.sh" || \
+                die "Cannot download rustup"
+            run_logged sh "$STAGE_DIR/rustup.sh" -y --profile minimal
+            export PATH="/root/.cargo/bin:$PATH"
+            rust_version_ok || die "Rust >= 1.75 is still unavailable."
+        fi
+
+        select_build_jobs
+        TOTAL_CPUS="$(nproc 2>/dev/null || printf '2')"
+        info "Source build mode: $BUILD_MODE ($BUILD_JOBS/$TOTAL_CPUS CPU jobs)"
+        run_build_progress 40 82 "Building Suricata+nDPI runtime" \
+            env BUILD_JOBS="$BUILD_JOBS" bash "$STAGE_DIR/scripts/build-runtime.sh" \
+                --output-dir "$BUILD_DIR/dist" \
+                --work-dir "$BUILD_DIR/source" \
+                --jobs "$BUILD_JOBS"
+
+        ASSET_PATH="$BUILD_DIR/dist/$ASSET_NAME"
+        CHECKSUM_PATH="$ASSET_PATH.sha256"
+    fi
+
+    [ -f "$ASSET_PATH" ] || die "Runtime archive is missing: $ASSET_PATH"
+    [ -f "$CHECKSUM_PATH" ] || die "Runtime checksum is missing: $CHECKSUM_PATH"
+    (
+        cd "$(dirname "$ASSET_PATH")"
+        sha256sum -c "$(basename "$CHECKSUM_PATH")"
+    ) >>"$INSTALL_LOG" 2>&1 || die "Runtime archive checksum mismatch"
+
+    archive_paths_safe "$ASSET_PATH" || die "Runtime archive contains unsafe paths"
+    run_timed_logged 84 "Extracting runtime" \
+        tar --zstd -xf "$ASSET_PATH" -C "$BUILD_DIR/runtime-root"
+
+    RUNTIME_ROOT="$BUILD_DIR/runtime-root"
+    run_logged python3 "$STAGE_DIR/scripts/verify-runtime.py" \
+        "$RUNTIME_ROOT" \
+        --app-version "$APP_VERSION" \
+        --engine-id "$ENGINE_ID" \
+        --os-version "$OS_VERSION_ID" \
+        --arch amd64 \
+        --runtime-prefix "$SURICATA_PREFIX"
+
+    mapfile -t RUNTIME_PACKAGES < <(
+        python3 - "$RUNTIME_ROOT/runtime-manifest.json" <<'PY_PACKAGES'
+import json
+import sys
+
+for package in json.load(open(sys.argv[1], encoding="utf-8")).get("runtime_packages", []):
+    print(package)
+PY_PACKAGES
+    )
+    [ "${#RUNTIME_PACKAGES[@]}" -gt 0 ] || \
+        die "Runtime manifest has no dependency package list"
+    ensure_packages 86 "Installing runtime libraries" "${RUNTIME_PACKAGES[@]}"
+
+    STAGED_PREFIX="$RUNTIME_ROOT$SURICATA_PREFIX"
+    STAGED_BIN="$STAGED_PREFIX/bin/suricata"
+    STAGED_CONFIG="$STAGED_PREFIX/etc/suricata/suricata.yaml"
+    STAGED_PLUGIN="$STAGED_PREFIX/lib/ezhik/ndpi.so"
+
+    run_logged python3 "$STAGE_DIR/scripts/render_suricata_config.py" \
+        "$STAGED_CONFIG" "$WAN_IF" "$WAN_IP" "$STAGED_PLUGIN"
+    run_logged ensure_suricata_yaml_header "$STAGED_CONFIG"
+    "$STAGED_BIN" -T -c "$STAGED_CONFIG" \
+        -S "$STAGE_DIR/suricata/ezhik-torrent-only.rules" \
+        >>"$INSTALL_LOG" 2>&1 || die "Staged Suricata runtime validation failed"
+
+    progress_done 85 "Runtime ready ($RUNTIME_SOURCE)"
 fi
 
 progress_status 88 "Installing Torrent Guard files"
 ui_line "\n"
 info "Installing Torrent Guard files..."
+
+# Compilation/download and staged validation happen while the current services
+# are still running. Stop them only for the short atomic install phase.
+systemctl stop ezhik-torrent-guard.service ezhik-ram-log-guard.service ezhik-suricata.service \
+    >/dev/null 2>&1 || true
+SERVICES_STOPPED=1
+
+if [ -n "$RUNTIME_ROOT" ]; then
+    STAGED_PREFIX="$RUNTIME_ROOT$SURICATA_PREFIX"
+    [ -d "$STAGED_PREFIX" ] || die "Staged runtime prefix is missing"
+
+    RUNTIME_BACKUP="${SURICATA_PREFIX}.previous"
+    rm -rf "$RUNTIME_BACKUP"
+    if [ -d "$SURICATA_PREFIX" ]; then
+        mv "$SURICATA_PREFIX" "$RUNTIME_BACKUP" || \
+            die "Cannot preserve the previous Suricata runtime"
+    fi
+    mv "$STAGED_PREFIX" "$SURICATA_PREFIX" || {
+        [ ! -d "$RUNTIME_BACKUP" ] || mv "$RUNTIME_BACKUP" "$SURICATA_PREFIX"
+        die "Cannot activate the new Suricata runtime"
+    }
+    RUNTIME_SWAPPED=1
+fi
+
 mkdir -p "$APP_DIR/suricata" "$APP_DIR/lib" "$CONFIG_DIR" "$STATE_DIR" || \
     die "Cannot create application directories"
 chmod 700 "$CONFIG_DIR" "$STATE_DIR"
 
+backup_app_metadata
+install -m 644 "$STAGE_DIR/VERSION" "$APP_DIR/VERSION" || die "Cannot install VERSION"
+install -m 644 "$STAGE_DIR/RUNTIME.env" "$APP_DIR/RUNTIME.env" || die "Cannot install RUNTIME.env"
 install -m 700 "$STAGE_DIR/src/guard.py" "$APP_DIR/guard.py" || die "Cannot install guard.py"
 install -m 700 "$STAGE_DIR/src/remnawave_actions.py" "$APP_DIR/remnawave_actions.py" || \
     die "Cannot install remnawave_actions.py"
 install -m 644 "$STAGE_DIR/suricata/ezhik-torrent-only.rules" \
     "$APP_DIR/suricata/ezhik-torrent-only.rules" || die "Cannot install torrent rule"
-install -m 755 "$PLUGIN_SRC" "$APP_DIR/lib/ndpi.so" || die "Cannot install strict nDPI plugin"
 install -m 755 "$STAGE_DIR/scripts/ezhik-ram-log-guard.sh" \
     /usr/local/sbin/ezhik-ram-log-guard.sh || die "Cannot install RAM log guard"
 install -m 755 "$STAGE_DIR/scripts/ezhik-torrent-guard-cleanup.sh" \
@@ -729,7 +972,7 @@ touch "$CONFIG_DIR/hold.txt"
 chmod 600 "$CONFIG_DIR/hold.txt"
 
 run_logged python3 "$STAGE_DIR/scripts/render_suricata_config.py" \
-    "$SURICATA_CONFIG" "$WAN_IF" "$WAN_IP" "$APP_DIR/lib/ndpi.so"
+    "$SURICATA_CONFIG" "$WAN_IF" "$WAN_IP" "$PLUGIN_PATH"
 
 # The renderer rewrites YAML and may drop Suricata's required directive/document marker.
 # Normalize them after every render before running suricata -T.
@@ -738,6 +981,32 @@ run_logged ensure_suricata_yaml_header "$SURICATA_CONFIG"
     die "Suricata YAML header repair failed: first line is invalid"
 [ "$(sed -n '2p' "$SURICATA_CONFIG")" = "---" ] || \
     die "Suricata YAML header repair failed: second line is invalid"
+
+python3 - "$APP_DIR/install-manifest.json" <<PY_INSTALL_MANIFEST
+import json
+import pathlib
+import sys
+import time
+
+pathlib.Path(sys.argv[1]).write_text(
+    json.dumps(
+        {
+            "format": 1,
+            "app_version": "${APP_VERSION}",
+            "engine_id": "${ENGINE_ID}",
+            "runtime_source": "${RUNTIME_SOURCE}",
+            "installed_at": int(time.time()),
+            "os": "ubuntu",
+            "os_version": "${OS_VERSION_ID}",
+            "arch": "amd64",
+        },
+        indent=2,
+        sort_keys=True,
+    ) + "\\n",
+    encoding="utf-8",
+)
+PY_INSTALL_MANIFEST
+chmod 600 "$APP_DIR/install-manifest.json"
 
 : >/dev/shm/ezhik-suricata-fast.log
 chmod 600 /dev/shm/ezhik-suricata-fast.log || true
@@ -794,10 +1063,17 @@ for svc in ezhik-suricata ezhik-torrent-guard ezhik-ram-log-guard; do
     fi
 done
 [ "$FAILED" -eq 0 ] || die "One or more services failed to start."
+SERVICES_STOPPED=0
 progress_done 100 "Torrent Guard installation complete"
 
-PLUGIN_SHA="$(sha256sum "$APP_DIR/lib/ndpi.so" | awk '{print $1}')"
+PLUGIN_SHA="$(sha256sum "$PLUGIN_PATH" | awk '{print $1}')"
 SURI_VERSION="$($SURICATA_BIN --build-info 2>/dev/null | sed -n 's/^This is Suricata version /Suricata /p' | head -n1)"
+
+# The new runtime is healthy; rollback data is no longer needed.
+RUNTIME_SWAPPED=0
+APP_METADATA_CHANGED=0
+[ -z "$RUNTIME_BACKUP" ] || rm -rf "$RUNTIME_BACKUP"
+rm -f "$APP_DIR/lib/ndpi.so"
 
 # Delete build sources only after all services are healthy.
 rm -rf "$BUILD_DIR"
@@ -807,7 +1083,7 @@ unset API_TOKEN
 cat <<__INSTALL_DONE__
 
 ============================================================
-             INSTALLATION COMPLETE — v$APP_VERSION
+             INSTALLATION COMPLETE - v$APP_VERSION
 ============================================================
 
  Developer          : ezhikdev

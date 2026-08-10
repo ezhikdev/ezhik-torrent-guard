@@ -11,6 +11,21 @@ from pathlib import Path
 from datetime import datetime
 
 
+def _app_version():
+    here = Path(__file__).resolve().parent
+    for candidate in (here / "VERSION", here.parent / "VERSION"):
+        try:
+            value = candidate.read_text(encoding="utf-8").strip()
+            if value:
+                return value
+        except OSError:
+            pass
+    return "unknown"
+
+
+APP_VERSION = _app_version()
+
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -454,7 +469,7 @@ def _api(method, path):
                 "application/json",
 
             "User-Agent":
-                "Ezhik-Torrent-Guard/1.0.0",
+                f"Ezhik-Torrent-Guard/{APP_VERSION}",
         },
     )
 

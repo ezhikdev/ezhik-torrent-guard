@@ -32,7 +32,7 @@ Client → Xray / RemnaNode → Internet
 
 Guard **не банит source IP** и не использует общий IP ingress для определения пользователя.
 
-## Особенности v1.0.0
+## Особенности v1.0.2
 
 - пассивный `AF_PACKET`, без inline/NFQUEUE;
 - не добавляет правила `iptables`;
@@ -48,7 +48,7 @@ Guard **не банит source IP** и не использует общий IP i
 - Suricata EVE и PCAP logging отключаются;
 - защита от накопления stale `tail` readers после restart Guard.
 
-> **Ограничение v1.0.0:** детектор настроен на IPv4. IPv6 — отдельная будущая задача.
+> **Ограничение v1.0.2:** детектор настроен на IPv4. IPv6 — отдельная будущая задача.
 
 ## Оптимизация runtime
 
@@ -70,7 +70,16 @@ Production-tested вариант рассчитан на:
 - Remnawave Panel API key;
 - Xray profile с RAM-only access/info logs.
 
-Первичная установка компилирует pinned nDPI и Suricata из исходников, поэтому занимает несколько минут.
+На Ubuntu 22.04 и 24.04 установщик скачивает готовый проверенный runtime из GitHub Release. Поэтому на сервере пользователя не запускается тяжёлая компиляция Suricata и nDPI. Для другой версии Ubuntu или при отсутствии подходящего release-asset автоматически используется сборка из исходников.
+
+Режим локальной сборки можно выбрать переменной окружения:
+
+```bash
+EZHIK_BUILD_MODE=eco bash install.sh       # 1 job, минимальная нагрузка
+EZHIK_BUILD_MODE=balanced bash install.sh  # до 4 jobs, режим по умолчанию
+EZHIK_BUILD_MODE=fast bash install.sh      # все доступные CPU
+EZHIK_FORCE_SOURCE=1 bash install.sh       # принудительно собирать из исходников
+```
 
 ## Обязательная настройка Xray
 
@@ -125,6 +134,27 @@ Enable LIVE Remnawave enforcement after install? [Y/n]:
 ```
 
 Installer сам определяет WAN interface и WAN IPv4. IP-адрес конкретного сервера в исходниках не зашит.
+
+При повторном запуске installer сравнивает установленный `/opt/ezhik-torrent-guard/VERSION` с `VERSION` репозитория:
+
+- более старая версия — предлагает обновление с сохранением текущих настроек;
+- та же версия — сообщает, что установлена последняя версия, и предлагает repair/reconfigure;
+- более новая версия — отказывается выполнять неявный downgrade.
+
+## Сборка готовых runtime-пакетов
+
+Workflow `.github/workflows/runtime-release.yml` собирает отдельные пакеты на официальных GitHub runners Ubuntu 22.04 и 24.04 с ограничением в два build jobs. Собственный сервер для сборки не нужен.
+
+Для теста откройте в GitHub вкладку **Actions**, выберите **Build runtime and release** и нажмите **Run workflow**. Будут выполнены две сборки и две проверки; результат останется временным Actions Artifact и не будет опубликован.
+
+Для публикации:
+
+```bash
+git tag v1.0.2
+git push origin v1.0.2
+```
+
+Значение тега должно точно соответствовать корневому `VERSION` с префиксом `v`. После успешных build/verify jobs workflow создаст GitHub Release и приложит оба runtime-пакета, SHA-256 и manifests. Для следующего релиза сначала измените `VERSION`, например на `1.0.3`, затем создайте тег `v1.0.3`.
 
 ## Что устанавливается
 
@@ -264,6 +294,10 @@ ezhik-torrent-guard/
 ├── uninstall.sh
 ├── README.md
 ├── VERSION
+├── RUNTIME.env
+├── .github/
+│   └── workflows/
+│       └── runtime-release.yml
 ├── src/
 │   ├── guard.py
 │   └── remnawave_actions.py
@@ -272,9 +306,12 @@ ezhik-torrent-guard/
 ├── scripts/
 │   ├── ezhik-ram-log-guard.sh
 │   ├── ezhik-torrent-guard-cleanup.sh
+│   ├── build-runtime.sh
+│   ├── create-release-manifest.py
 │   ├── patch_ndpi_strict.py
 │   ├── patch_suricata_ndpi.py
-│   └── render_suricata_config.py
+│   ├── render_suricata_config.py
+│   └── verify-runtime.py
 ├── systemd/
 │   ├── ezhik-suricata.service.template
 │   ├── ezhik-torrent-guard.service

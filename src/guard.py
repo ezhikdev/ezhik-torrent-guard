@@ -16,6 +16,21 @@ from functools import lru_cache
 import remnawave_actions as remna_actions
 
 
+def _app_version():
+    here = Path(__file__).resolve().parent
+    for candidate in (here / "VERSION", here.parent / "VERSION"):
+        try:
+            value = candidate.read_text(encoding="utf-8").strip()
+            if value:
+                return value
+        except OSError:
+            pass
+    return "unknown"
+
+
+APP_VERSION = _app_version()
+
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -1135,7 +1150,7 @@ def main():
     signal.signal(signal.SIGTERM, stop)
 
     print("================================================")
-    print(" EZHIK TORRENT GUARD v1.0.0")
+    print(f" EZHIK TORRENT GUARD v{APP_VERSION}")
     print(" MODE: " + ("DRY RUN" if DRY_RUN else "LIVE REMNAWAVE"))
     print()
     print(" Exact Xray socket <-> strict nDPI attribution")
@@ -1188,7 +1203,7 @@ def main():
     finally:
         print()
         print(
-            "Stopping Torrent Guard v1.0.0...",
+            f"Stopping Torrent Guard v{APP_VERSION}...",
             flush=True,
         )
 
