@@ -87,7 +87,7 @@ class _Window:
 
 
 class ScanDetector:
-    """Bounded RAM-only behavioral detector for exact Xray sockets."""
+    """Bounded RAM-only detector for attributed Xray destinations/sockets."""
 
     def __init__(
         self,
@@ -235,6 +235,29 @@ class ScanDetector:
             )
 
         return None
+
+    def observe_destination(self, client, proto, destination, now=None):
+        """Observe an authenticated Xray request even when connect fails."""
+
+        destination = str(destination).strip()
+        if not destination or destination.startswith("["):
+            return None
+
+        try:
+            remote_ip, remote_port = destination.rsplit(":", 1)
+        except ValueError:
+            return None
+
+        return self.observe(
+            client,
+            (
+                str(proto).lower(),
+                0,
+                remote_ip,
+                remote_port,
+            ),
+            now=now,
+        )
 
     def cleanup(self, now=None):
         now = self.clock() if now is None else float(now)

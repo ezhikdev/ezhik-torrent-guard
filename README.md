@@ -32,7 +32,7 @@ Client → Xray / RemnaNode → Internet
 
 Guard **не банит source IP** и не использует общий IP ingress для определения пользователя.
 
-## Особенности v1.2.0
+## Особенности v1.2.1
 
 - пассивный `AF_PACKET`, без inline/NFQUEUE;
 - не добавляет правила `iptables`;
@@ -53,13 +53,16 @@ Guard **не банит source IP** и не использует общий IP i
 - постоянная блокировка забывается после подтверждённого disable и снимается вручную в Remnawave Panel;
 - Telegram-уведомление с `.txt` incident report и ограниченная локальная ротация отчётов.
 
-> **Ограничение v1.2.0:** детекторы настроены на IPv4. IPv6 — отдельная будущая задача.
+> **Ограничение v1.2.1:** детекторы настроены на IPv4. IPv6 — отдельная будущая задача.
 
 ## Защита от сканирования портов
 
-Port-scan detector не запускает второй DPI и не анализирует payload. Он получает
-только outbound sockets, которые `guard.py` уже однозначно связал с numeric
-client ID Xray, и поддерживает ограниченные TTL-счётчики в RAM.
+Port-scan detector не запускает второй DPI и не анализирует payload. Основной
+источник — Xray access-событие, которое уже содержит authenticated numeric client
+ID и запрошенный destination. Поэтому попытка учитывается даже тогда, когда
+удалённый порт закрыт и Xray не смог создать outbound socket. Успешно открытый
+socket остаётся резервным источником для доменных destinations; одинаковые
+`protocol + IP + port` дедуплицируются в RAM-окне.
 
 Триггеры по умолчанию:
 
@@ -187,8 +190,8 @@ Workflow `.github/workflows/runtime-release.yml` собирает отдельн
 Для публикации:
 
 ```bash
-git tag v1.2.0
-git push origin v1.2.0
+git tag v1.2.1
+git push origin v1.2.1
 ```
 
 Значение тега должно точно соответствовать корневому `VERSION` с префиксом `v`. После успешных build/verify jobs workflow создаст GitHub Release и приложит оба runtime-пакета, SHA-256 и manifests. Для следующего релиза сначала измените `VERSION`, например на `1.0.3`, затем создайте тег `v1.0.3`.

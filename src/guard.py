@@ -566,6 +566,12 @@ def process_access(line):
 
     stats["access"] += 1
 
+    process_scan_destination(
+        email,
+        proto,
+        dest,
+    )
+
     # received request мог появиться чуть раньше access.
     for rid in requests_by_dest.get(key, ()):
         try_map_request(rid)
@@ -690,15 +696,7 @@ def process_info(line):
 # PORT-SCAN EVIDENCE
 # ============================================================
 
-def process_scan_socket(client, key):
-
-    if not SCAN_ENABLED:
-        return
-
-    report = SCAN_DETECTOR.observe(
-        client,
-        key,
-    )
+def handle_scan_report(client, report):
 
     if report is None:
         return
@@ -755,6 +753,39 @@ def process_scan_socket(client, key):
 
     telegram_notifier.notify_scan(
         report
+    )
+
+
+def process_scan_destination(client, proto, destination):
+
+    if not SCAN_ENABLED:
+        return
+
+    report = SCAN_DETECTOR.observe_destination(
+        client,
+        proto,
+        destination,
+    )
+
+    handle_scan_report(
+        client,
+        report,
+    )
+
+
+def process_scan_socket(client, key):
+
+    if not SCAN_ENABLED:
+        return
+
+    report = SCAN_DETECTOR.observe(
+        client,
+        key,
+    )
+
+    handle_scan_report(
+        client,
+        report,
     )
 
 
