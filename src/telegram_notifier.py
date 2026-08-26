@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import html
 import json
 import os
 import queue
@@ -21,6 +22,22 @@ _events = queue.Queue(maxsize=100)
 _worker_thread = None
 _bot_token = None
 _chat_id = None
+
+
+REASON_LABELS = {
+    "vertical-port-scan": "Перебор портов одного IP-адреса",
+    "subnet-port-scan": "Сканирование адресов одной подсети /24",
+    "distributed-port-scan": "Распределённое сканирование адресов и портов",
+}
+
+ACTION_LABELS = {
+    "WOULD_BLOCK": "Наблюдение — клиент не заблокирован",
+    "BLOCK_QUEUED": "Блокировка поставлена в очередь",
+    "PROTECTED_NO_ACTION": "Защищённый клиент — блокировка не применяется",
+    "NO_ACTION_ALREADY_BLOCKED_OR_PENDING": (
+        "Клиент уже заблокирован или ожидает блокировки"
+    ),
+}
 
 
 def _load_env_file():
@@ -46,39 +63,74 @@ def _load_env_file():
 
 def _format_duration(seconds):
     if seconds == 0:
-        return "permanent (manual Remnawave unblock)"
+        return "бессрочно; разблокировка вручную в Remnawave"
     if seconds % 3600 == 0:
-        return f"{seconds // 3600}h"
+        return f"{seconds // 3600} ч."
     if seconds % 60 == 0:
-        return f"{seconds // 60}m"
-    return f"{seconds}s"
+        return f"{seconds // 60} мин."
+    return f"{seconds} сек."
+
+
+def _format_time(timestamp):
+    return datetime.fromtimestamp(
+        timestamp,
+        tz=timezone.utc,
+    ).strftime("%d.%m.%Y %H:%M:%S UTC")
+
+
+def _reason_label(reason):
+    return REASON_LABELS.get(reason, reason)
+
+
+def _action_label(action):
+    return ACTION_LABELS.get(action, action)
+
+
+def _target_lines(details):
+    if "target_ip" in details:
+        return [
+            f"Целевой IP: {details['target_ip']}",
+            f"Уникальных портов цели: {details['target_unique_ports']}",
+        ]
+    if "target_subnet" in details:
+        return [
+            f"Целевая подсеть: {details['target_subnet']}",
+            f"Уникальных адресов подсети: {details['subnet_unique_hosts']}",
+            f"Уникальных портов подсети: {details['subnet_unique_ports']}",
+        ]
+    if "burst_unique_endpoints" in details:
+        return [
+            f"Назначений во всплеске: {details['burst_unique_endpoints']}",
+            f"Уникальных портов во всплеске: {details['burst_unique_ports']}",
+        ]
+    return []
 
 
 def _incident_text(report):
-    detected = datetime.fromtimestamp(
-        report["detected_at"],
-        tz=timezone.utc,
-    ).isoformat(timespec="seconds")
+    detected = _format_time(report["detected_at"])
+    details = report.get("details", {})
 
     lines = [
-        "Ezhik Torrent Guard - port-scan incident",
+        "Ezhik Torrent Guard — отчёт о сканировании портов",
         "",
-        f"detected_at_utc: {detected}",
-        f"node_ip: {report.get('node_ip', 'unknown')}",
-        f"client_id: {report['client_id']}",
-        f"reason: {report['reason']}",
-        f"action: {report.get('action', 'unknown')}",
-        f"block_duration: {_format_duration(report['block_seconds'])}",
-        f"window_seconds: {report['window_seconds']}",
-        f"unique_endpoints: {report['unique_endpoints']}",
-        f"unique_ips: {report['unique_ips']}",
-        f"unique_ports: {report['unique_ports']}",
+        f"Время обнаружения: {detected}",
+        f"IP ноды: {report.get('node_ip', 'неизвестно')}",
+        f"ID клиента: {report['client_id']}",
+        f"Нарушение: {_reason_label(report['reason'])}",
+        f"Реакция: {_action_label(report.get('action', 'неизвестно'))}",
+        f"Настроенная блокировка: {_format_duration(report['block_seconds'])}",
+        "",
+        f"Окно анализа: {report['window_seconds']} сек.",
+        f"Уникальных назначений: {report['unique_endpoints']}",
+        f"Уникальных IP-адресов: {report['unique_ips']}",
+        f"Уникальных портов: {report['unique_ports']}",
     ]
 
-    for key, value in sorted(report.get("details", {}).items()):
-        lines.append(f"{key}: {value}")
+    target_lines = _target_lines(details)
+    if target_lines:
+        lines.extend([""] + target_lines)
 
-    lines.extend(["", "sample_endpoints:"])
+    lines.extend(["", "Примеры назначений:"])
     for item in report.get("sample_endpoints", []):
         lines.append(
             f"{item['protocol'].upper()} "
@@ -152,26 +204,58 @@ def _multipart(fields, file_path):
 
 
 def _send(report, file_path):
-    detected = datetime.fromtimestamp(
-        report["detected_at"],
-        tz=timezone.utc,
-    ).isoformat(timespec="seconds")
-    caption = (
-        "Ezhik Port-Scan Guard\n"
-        f"Client: {report['client_id']}\n"
-        f"Node: {report.get('node_ip', 'unknown')}\n"
-        f"Time: {detected}\n"
-        f"Reason: {report['reason']}\n"
-        f"Action: {report.get('action', 'unknown')}\n"
-        f"Block: {_format_duration(report['block_seconds'])}\n"
-        f"Endpoints/IPs/ports: {report['unique_endpoints']}/"
-        f"{report['unique_ips']}/{report['unique_ports']}"
+    detected = _format_time(report["detected_at"])
+    reason = _reason_label(report["reason"])
+    action = _action_label(report.get("action", "неизвестно"))
+    details = report.get("details", {})
+
+    caption_lines = [
+        "🚨 <b>Обнаружено сканирование портов</b>",
+        "",
+        f"👤 <b>Клиент:</b> {html.escape(str(report['client_id']))}",
+        f"🌐 <b>Нода:</b> {html.escape(str(report.get('node_ip', 'неизвестно')))}",
+        f"🕒 <b>Время:</b> {html.escape(detected)}",
+        "",
+        f"🔎 <b>Нарушение:</b> {html.escape(reason)}",
+    ]
+
+    if "target_ip" in details:
+        caption_lines.append(
+            f"🎯 <b>Цель:</b> {html.escape(str(details['target_ip']))} · "
+            f"портов: <b>{int(details['target_unique_ports'])}</b>"
+        )
+    elif "target_subnet" in details:
+        caption_lines.append(
+            f"🎯 <b>Подсеть:</b> {html.escape(str(details['target_subnet']))} · "
+            f"адресов: <b>{int(details['subnet_unique_hosts'])}</b> · "
+            f"портов: <b>{int(details['subnet_unique_ports'])}</b>"
+        )
+
+    caption_lines.extend(
+        [
+            (
+                f"📊 <b>За {int(report['window_seconds'])} сек.:</b> "
+                f"назначений {int(report['unique_endpoints'])} · "
+                f"IP {int(report['unique_ips'])} · "
+                f"портов {int(report['unique_ports'])}"
+            ),
+            "",
+            f"🛡 <b>Реакция:</b> {html.escape(action)}",
+            (
+                "⏳ <b>Блокировка по настройке:</b> "
+                f"{html.escape(_format_duration(report['block_seconds']))}"
+            ),
+            "",
+            "📎 Полный технический отчёт приложен к сообщению.",
+        ]
     )
+    caption = "\n".join(caption_lines)
 
     boundary, body = _multipart(
         {
             "chat_id": _chat_id,
             "caption": caption,
+            "parse_mode": "HTML",
         },
         file_path,
     )

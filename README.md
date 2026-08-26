@@ -32,7 +32,7 @@ Client → Xray / RemnaNode → Internet
 
 Guard **не банит source IP** и не использует общий IP ingress для определения пользователя.
 
-## Особенности v1.2.1
+## Особенности v1.2.2
 
 - пассивный `AF_PACKET`, без inline/NFQUEUE;
 - не добавляет правила `iptables`;
@@ -51,9 +51,9 @@ Guard **не банит source IP** и не использует общий IP i
 - отдельные режимы port-scan `OBSERVE` и `LIVE`;
 - временная или постоянная (`0` минут) блокировка за сканирование;
 - постоянная блокировка забывается после подтверждённого disable и снимается вручную в Remnawave Panel;
-- Telegram-уведомление с `.txt` incident report и ограниченная локальная ротация отчётов.
+- понятное русскоязычное Telegram-уведомление с `.txt` incident report и ограниченная локальная ротация отчётов.
 
-> **Ограничение v1.2.1:** детекторы настроены на IPv4. IPv6 — отдельная будущая задача.
+> **Ограничение v1.2.2:** детекторы настроены на IPv4. IPv6 — отдельная будущая задача.
 
 ## Защита от сканирования портов
 
@@ -190,8 +190,8 @@ Workflow `.github/workflows/runtime-release.yml` собирает отдельн
 Для публикации:
 
 ```bash
-git tag v1.2.1
-git push origin v1.2.1
+git tag v1.2.2
+git push origin v1.2.2
 ```
 
 Значение тега должно точно соответствовать корневому `VERSION` с префиксом `v`. После успешных build/verify jobs workflow создаст GitHub Release и приложит оба runtime-пакета, SHA-256 и manifests. Для следующего релиза сначала измените `VERSION`, например на `1.0.3`, затем создайте тег `v1.0.3`.
@@ -382,8 +382,10 @@ ezhik-torrent-guard/
 │   └── ezhik-ram-log-guard.service
 ├── tests/
 │   ├── test_scan_detector.py
-│   └── test_remnawave_actions.py
+│   ├── test_remnawave_actions.py
+│   └── test_telegram_notifier.py
 └── docs/
+    ├── HOSTER_PORT_SCAN_PROTECTION_RU.md
     └── XRAY_LOGGING.md
 ```
 
