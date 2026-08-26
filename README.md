@@ -1,6 +1,6 @@
 # 🦔 Ezhik Torrent Guard
 
-> Автоматическая защита Xray / Remnawave exit-нод от BitTorrent abuse.
+> Автоматическая защита Xray / Remnawave exit-нод от BitTorrent abuse и исходящего сканирования портов.
 
 ```text
 Developer : ezhikdev
@@ -8,7 +8,7 @@ Telegram  : @ezhikdev
 GitHub    : https://github.com/ezhikdev
 ```
 
-Ezhik Torrent Guard пассивно обнаруживает BitTorrent-трафик на exit-сервере, связывает **реальный outbound socket Xray** с аутентифицированным пользователем Remnawave и временно отключает точную подписку через Remnawave API.
+Ezhik Torrent Guard пассивно обнаруживает BitTorrent-трафик и аномальное сканирование портов на exit-сервере, связывает **реальный outbound socket Xray** с аутентифицированным пользователем Remnawave и отключает точную подписку через Remnawave API.
 
 ## Как это работает
 
@@ -32,7 +32,7 @@ Client → Xray / RemnaNode → Internet
 
 Guard **не банит source IP** и не использует общий IP ingress для определения пользователя.
 
-## Особенности v1.1.1
+## Особенности v1.2.0
 
 - пассивный `AF_PACKET`, без inline/NFQUEUE;
 - не добавляет правила `iptables`;
@@ -47,8 +47,34 @@ Guard **не банит source IP** и не использует общий IP i
 - raw connection metadata обрабатывается в RAM и автоматически очищается;
 - Suricata EVE и PCAP logging отключаются;
 - защита от накопления stale `tail` readers после restart Guard.
+- RAM-only port-scan detector поверх уже атрибутированных Xray sockets;
+- отдельные режимы port-scan `OBSERVE` и `LIVE`;
+- временная или постоянная (`0` минут) блокировка за сканирование;
+- постоянная блокировка забывается после подтверждённого disable и снимается вручную в Remnawave Panel;
+- Telegram-уведомление с `.txt` incident report и ограниченная локальная ротация отчётов.
 
-> **Ограничение v1.1.1:** детектор настроен на IPv4. IPv6 — отдельная будущая задача.
+> **Ограничение v1.2.0:** детекторы настроены на IPv4. IPv6 — отдельная будущая задача.
+
+## Защита от сканирования портов
+
+Port-scan detector не запускает второй DPI и не анализирует payload. Он получает
+только outbound sockets, которые `guard.py` уже однозначно связал с numeric
+client ID Xray, и поддерживает ограниченные TTL-счётчики в RAM.
+
+Триггеры по умолчанию:
+
+- `20` разных портов одного IP за `60` секунд;
+- `16` адресов одной `/24` и `50` разных портов за `60` секунд;
+- `100` уникальных `IP:port` и `50` разных портов за `15` секунд.
+
+Большое число HTTPS/QUIC-соединений только к `443` не достигает порога
+разнообразия портов. После события для клиента действует cooldown `300` секунд,
+чтобы один инцидент не создавал поток одинаковых уведомлений.
+
+В `OBSERVE` Guard только пишет `[SCAN DETECTED]`, сохраняет incident report и
+отправляет Telegram-уведомление. В `LIVE` он ставит disable в безопасную очередь
+Remnawave. При длительности `0` после подтверждённого `DISABLED` локальное
+состояние удаляется: последующая разблокировка выполняется вручную в панели.
 
 ## Оптимизация runtime
 
@@ -111,7 +137,11 @@ Installer интерактивно спросит:
 2. API key — ввод скрытый;
 3. protected numeric client IDs, если нужны;
 4. длительность freeze (по умолчанию 15 минут);
-5. запускать сразу в `LIVE` или оставить `DRY RUN`.
+5. запускать torrent enforcement сразу в `LIVE` или оставить `DRY RUN`;
+6. включить ли port-scan detector;
+7. длительность блокировки за сканирование (`0` — до ручной разблокировки);
+8. port-scan режим `OBSERVE` или `LIVE`;
+9. опциональные Telegram bot token и numeric admin chat ID.
 
 Пример:
 
@@ -133,6 +163,11 @@ Remnawave API key: ********
 Protected Remnawave client IDs, comma-separated (optional):
 Freeze duration in minutes [15]:
 Enable LIVE Remnawave enforcement after install? [Y/n]:
+Enable port-scan detection? [Y/n]:
+Port-scan block duration in minutes (0 = permanent) [60]:
+Enable LIVE port-scan enforcement after install? [y/N]:
+Telegram bot token (optional; Enter keeps/disables): ********
+Telegram admin chat ID (optional): 123456789
 ```
 
 Installer сам определяет WAN interface и WAN IPv4. IP-адрес конкретного сервера в исходниках не зашит.
@@ -147,13 +182,13 @@ Installer сам определяет WAN interface и WAN IPv4. IP-адрес �
 
 Workflow `.github/workflows/runtime-release.yml` собирает отдельные пакеты на официальных GitHub runners Ubuntu 22.04 и 24.04 с ограничением в два build jobs. Собственный сервер для сборки не нужен.
 
-Для теста откройте в GitHub вкладку **Actions**, выберите **Build runtime and release** и нажмите **Run workflow**. Будут выполнены две сборки и две проверки; результат останется временным Actions Artifact и не будет опубликован.
+Для теста откройте в GitHub вкладку **Actions**, выберите **Build runtime and release** и нажмите **Run workflow**. Будут выполнены source checks, две сборки и две runtime-проверки; результат останется временным Actions Artifact и не будет опубликован.
 
 Для публикации:
 
 ```bash
-git tag v1.1.1
-git push origin v1.1.1
+git tag v1.2.0
+git push origin v1.2.0
 ```
 
 Значение тега должно точно соответствовать корневому `VERSION` с префиксом `v`. После успешных build/verify jobs workflow создаст GitHub Release и приложит оба runtime-пакета, SHA-256 и manifests. Для следующего релиза сначала измените `VERSION`, например на `1.0.3`, затем создайте тег `v1.0.3`.
@@ -213,6 +248,20 @@ journalctl -fu ezhik-torrent-guard
 [WOULD_FREEZE] client=12345 ...
 ```
 
+Port-scan наблюдение:
+
+```text
+[SCAN DETECTED] client=12345 reason=vertical-port-scan ... action=WOULD_BLOCK
+[TELEGRAM SENT] client=12345 file=port-scan-...txt
+```
+
+Постоянная live-блокировка:
+
+```text
+[ACTION QUEUED] client=12345 action=freeze reason=port-scan duration=permanent
+[BLOCKED] client=12345 duration=permanent manual_unblock=remnawave-panel
+```
+
 ## Protected clients
 
 Во время установки можно указать client IDs, которые Guard **никогда не будет отключать**:
@@ -245,7 +294,7 @@ EVE            → disabled
 PCAP logging   → disabled
 ```
 
-На диск сохраняется только минимальное sanction state, необходимое для безопасного автоматического unfreeze после restart:
+На диск сохраняется минимальное sanction state, необходимое для безопасного автоматического unfreeze после restart:
 
 ```text
 client_id
@@ -257,6 +306,13 @@ reason
 ```
 
 История peer IP / remote ports / visited domains в sanction state не сохраняется.
+
+Для подтверждённых port-scan событий отдельно сохраняется не более 100 текстовых
+incident reports в `/var/lib/ezhik-torrent-guard/incidents/` с правами `0600`.
+Каждый файл содержит агрегированные счётчики и не более 100 sample endpoints;
+payload пакетов не сохраняется. Telegram token находится в отдельном
+`/etc/ezhik-torrent-guard/telegram.env` с правами `0600` и не передаётся через
+systemd EnvironmentFile.
 
 ## Безопасность действий Remnawave
 
@@ -302,7 +358,9 @@ ezhik-torrent-guard/
 │       └── runtime-release.yml
 ├── src/
 │   ├── guard.py
-│   └── remnawave_actions.py
+│   ├── remnawave_actions.py
+│   ├── scan_detector.py
+│   └── telegram_notifier.py
 ├── suricata/
 │   └── ezhik-torrent-only.rules
 ├── scripts/
@@ -319,10 +377,13 @@ ezhik-torrent-guard/
 │   ├── ezhik-torrent-guard.service
 │   ├── ezhik-torrent-guard-cleanup.conf
 │   └── ezhik-ram-log-guard.service
+├── tests/
+│   ├── test_scan_detector.py
+│   └── test_remnawave_actions.py
 └── docs/
     └── XRAY_LOGGING.md
 ```
 
 ## Disclaimer
 
-Torrent/DPI detection не может гарантировать распознавание абсолютно каждого клиента, будущей обфускации или каждого варианта протокола. Перед массовым rollout рекомендуется сначала поставить новую версию на одну exit-ноду и проверить `DRY RUN` на своей тестовой подписке.
+Torrent/DPI и поведенческий port-scan detection не могут гарантировать распознавание абсолютно каждого нарушения без ложных срабатываний. Port-scan защита не является inline firewall: несколько первых соединений успеют выйти до достижения порога и применения Remnawave disable. Перед массовым rollout рекомендуется поставить новую версию на одну exit-ноду, оставить port-scan в `OBSERVE` и проверить игры, видео, браузинг и контролируемый скан собственной тестовой системы.

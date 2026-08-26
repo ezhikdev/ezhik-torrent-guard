@@ -407,6 +407,20 @@ config_value() {
     sed -n "s/^${key}=//p" "$file" | tail -n1
 }
 
+config_positive_or_default() {
+    local file="$1"
+    local key="$2"
+    local default="$3"
+    local value
+
+    value="$(config_value "$file" "$key")"
+    if [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+        printf '%s' "$value"
+    else
+        printf '%s' "$default"
+    fi
+}
+
 installed_engine_id() {
     local manifest="$SURICATA_PREFIX/ezhik-runtime-manifest.json"
     [ -r "$manifest" ] || return 0
@@ -658,6 +672,19 @@ EXISTING_API_TOKEN="$(config_value "$CONFIG_DIR/api.env" REMNAWAVE_API_TOKEN)"
 EXISTING_PROTECTED="$(config_value "$CONFIG_DIR/settings.env" EZHIK_PROTECTED_CLIENTS)"
 EXISTING_FREEZE_SECONDS="$(config_value "$CONFIG_DIR/settings.env" EZHIK_FREEZE_SECONDS)"
 EXISTING_DRY_RUN="$(config_value "$CONFIG_DIR/settings.env" EZHIK_DRY_RUN)"
+EXISTING_SCAN_ENABLED="$(config_value "$CONFIG_DIR/settings.env" EZHIK_SCAN_ENABLED)"
+EXISTING_SCAN_DRY_RUN="$(config_value "$CONFIG_DIR/settings.env" EZHIK_SCAN_DRY_RUN)"
+EXISTING_SCAN_BLOCK_SECONDS="$(config_value "$CONFIG_DIR/settings.env" EZHIK_SCAN_BLOCK_SECONDS)"
+EXISTING_TELEGRAM_TOKEN="$(config_value "$CONFIG_DIR/telegram.env" TELEGRAM_BOT_TOKEN)"
+EXISTING_TELEGRAM_CHAT_ID="$(config_value "$CONFIG_DIR/telegram.env" TELEGRAM_CHAT_ID)"
+SCAN_WINDOW_SECONDS="$(config_positive_or_default "$CONFIG_DIR/settings.env" EZHIK_SCAN_WINDOW_SECONDS 60)"
+SCAN_BURST_WINDOW_SECONDS="$(config_positive_or_default "$CONFIG_DIR/settings.env" EZHIK_SCAN_BURST_WINDOW_SECONDS 15)"
+SCAN_VERTICAL_PORTS="$(config_positive_or_default "$CONFIG_DIR/settings.env" EZHIK_SCAN_VERTICAL_PORTS 20)"
+SCAN_BURST_ENDPOINTS="$(config_positive_or_default "$CONFIG_DIR/settings.env" EZHIK_SCAN_BURST_ENDPOINTS 100)"
+SCAN_BURST_PORTS="$(config_positive_or_default "$CONFIG_DIR/settings.env" EZHIK_SCAN_BURST_PORTS 50)"
+SCAN_SUBNET_HOSTS="$(config_positive_or_default "$CONFIG_DIR/settings.env" EZHIK_SCAN_SUBNET_HOSTS 16)"
+SCAN_SUBNET_PORTS="$(config_positive_or_default "$CONFIG_DIR/settings.env" EZHIK_SCAN_SUBNET_PORTS 50)"
+SCAN_COOLDOWN_SECONDS="$(config_positive_or_default "$CONFIG_DIR/settings.env" EZHIK_SCAN_COOLDOWN_SECONDS 300)"
 
 FREEZE_DEFAULT=15
 if [[ "$EXISTING_FREEZE_SECONDS" =~ ^[0-9]+$ ]] && \
@@ -696,6 +723,65 @@ else
     MODE="DRY RUN"
 fi
 ok "Enforcement mode selected: $MODE"
+
+SCAN_ENABLED_DEFAULT=Y
+[ "$EXISTING_SCAN_ENABLED" = "false" ] && SCAN_ENABLED_DEFAULT=N
+
+if confirm "Enable port-scan detection?" "$SCAN_ENABLED_DEFAULT"; then
+    SCAN_ENABLED="true"
+
+    SCAN_BLOCK_DEFAULT=60
+    if [[ "$EXISTING_SCAN_BLOCK_SECONDS" =~ ^[0-9]+$ ]]; then
+        SCAN_BLOCK_DEFAULT=$((EXISTING_SCAN_BLOCK_SECONDS / 60))
+    fi
+
+    SCAN_BLOCK_MINUTES="$(prompt \
+        'Port-scan block duration in minutes (0 = permanent)' \
+        "$SCAN_BLOCK_DEFAULT")"
+    [[ "$SCAN_BLOCK_MINUTES" =~ ^[0-9]+$ ]] || \
+        die "Port-scan block duration must be zero or a positive number."
+    if [ "$SCAN_BLOCK_MINUTES" -gt 10080 ]; then
+        die "Port-scan block duration must be between 0 and 10080 minutes."
+    fi
+    SCAN_BLOCK_SECONDS=$((SCAN_BLOCK_MINUTES * 60))
+
+    SCAN_LIVE_DEFAULT=N
+    [ "$EXISTING_SCAN_DRY_RUN" = "false" ] && SCAN_LIVE_DEFAULT=Y
+    if confirm "Enable LIVE port-scan enforcement after install?" "$SCAN_LIVE_DEFAULT"; then
+        SCAN_DRY_RUN="false"
+        SCAN_MODE="LIVE"
+    else
+        SCAN_DRY_RUN="true"
+        SCAN_MODE="OBSERVE"
+    fi
+
+    TELEGRAM_TOKEN="$(prompt_secret_existing \
+        'Telegram bot token (optional; Enter keeps/disables)' \
+        "$EXISTING_TELEGRAM_TOKEN")"
+    TELEGRAM_CHAT_ID="$(prompt \
+        'Telegram admin chat ID (optional)' \
+        "$EXISTING_TELEGRAM_CHAT_ID")"
+
+    if { [ -n "$TELEGRAM_TOKEN" ] && [ -z "$TELEGRAM_CHAT_ID" ]; } || \
+       { [ -z "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; }; then
+        die "Telegram bot token and chat ID must be configured together."
+    fi
+    if [ -n "$TELEGRAM_TOKEN" ]; then
+        [[ "$TELEGRAM_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || \
+            die "Telegram bot token format is invalid."
+        [[ "$TELEGRAM_CHAT_ID" =~ ^-?[0-9]+$ ]] || \
+            die "Telegram chat ID must be numeric."
+    fi
+else
+    SCAN_ENABLED="false"
+    SCAN_DRY_RUN="true"
+    SCAN_MODE="DISABLED"
+    SCAN_BLOCK_MINUTES=60
+    SCAN_BLOCK_SECONDS=3600
+    TELEGRAM_TOKEN="$EXISTING_TELEGRAM_TOKEN"
+    TELEGRAM_CHAT_ID="$EXISTING_TELEGRAM_CHAT_ID"
+fi
+ok "Port-scan protection selected: $SCAN_MODE"
 
 AUTH_HEADERS="$STAGE_DIR/remnawave-headers.txt"
 printf 'Authorization: Bearer %s\nAccept: application/json\n' "$API_TOKEN" >"$AUTH_HEADERS" || \
@@ -759,6 +845,8 @@ for rel in \
     RUNTIME.env \
     src/guard.py \
     src/remnawave_actions.py \
+    src/scan_detector.py \
+    src/telegram_notifier.py \
     suricata/ezhik-torrent-only.rules \
     scripts/ezhik-ram-log-guard.sh \
     scripts/ezhik-torrent-guard-cleanup.sh \
@@ -960,6 +1048,10 @@ install -m 644 "$STAGE_DIR/RUNTIME.env" "$APP_DIR/RUNTIME.env" || die "Cannot in
 install -m 700 "$STAGE_DIR/src/guard.py" "$APP_DIR/guard.py" || die "Cannot install guard.py"
 install -m 700 "$STAGE_DIR/src/remnawave_actions.py" "$APP_DIR/remnawave_actions.py" || \
     die "Cannot install remnawave_actions.py"
+install -m 700 "$STAGE_DIR/src/scan_detector.py" "$APP_DIR/scan_detector.py" || \
+    die "Cannot install scan_detector.py"
+install -m 700 "$STAGE_DIR/src/telegram_notifier.py" "$APP_DIR/telegram_notifier.py" || \
+    die "Cannot install telegram_notifier.py"
 install -m 644 "$STAGE_DIR/suricata/ezhik-torrent-only.rules" \
     "$APP_DIR/suricata/ezhik-torrent-only.rules" || die "Cannot install torrent rule"
 install -m 755 "$STAGE_DIR/scripts/ezhik-ram-log-guard.sh" \
@@ -967,12 +1059,17 @@ install -m 755 "$STAGE_DIR/scripts/ezhik-ram-log-guard.sh" \
 install -m 755 "$STAGE_DIR/scripts/ezhik-torrent-guard-cleanup.sh" \
     /usr/local/sbin/ezhik-torrent-guard-cleanup.sh || die "Cannot install cleanup script"
 
-# API credentials are deliberately kept out of the process EnvironmentFile.
+# API and Telegram credentials are kept out of the process EnvironmentFile.
 umask 077
 cat >"$CONFIG_DIR/api.env" <<__API_ENV__
 REMNAWAVE_BASE_URL=$PANEL_URL
 REMNAWAVE_API_TOKEN=$API_TOKEN
 __API_ENV__
+
+cat >"$CONFIG_DIR/telegram.env" <<__TELEGRAM_ENV__
+TELEGRAM_BOT_TOKEN=$TELEGRAM_TOKEN
+TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID
+__TELEGRAM_ENV__
 
 cat >"$CONFIG_DIR/settings.env" <<__SETTINGS_ENV__
 EZHIK_LOCAL_IP=$WAN_IP
@@ -980,12 +1077,23 @@ EZHIK_REMNANODE_CONTAINER=$REMNANODE_CONTAINER
 EZHIK_PROTECTED_CLIENTS=$PROTECTED_CLIENTS
 EZHIK_FREEZE_SECONDS=$FREEZE_SECONDS
 EZHIK_DRY_RUN=$DRY_RUN
+EZHIK_SCAN_ENABLED=$SCAN_ENABLED
+EZHIK_SCAN_DRY_RUN=$SCAN_DRY_RUN
+EZHIK_SCAN_BLOCK_SECONDS=$SCAN_BLOCK_SECONDS
+EZHIK_SCAN_WINDOW_SECONDS=$SCAN_WINDOW_SECONDS
+EZHIK_SCAN_BURST_WINDOW_SECONDS=$SCAN_BURST_WINDOW_SECONDS
+EZHIK_SCAN_VERTICAL_PORTS=$SCAN_VERTICAL_PORTS
+EZHIK_SCAN_BURST_ENDPOINTS=$SCAN_BURST_ENDPOINTS
+EZHIK_SCAN_BURST_PORTS=$SCAN_BURST_PORTS
+EZHIK_SCAN_SUBNET_HOSTS=$SCAN_SUBNET_HOSTS
+EZHIK_SCAN_SUBNET_PORTS=$SCAN_SUBNET_PORTS
+EZHIK_SCAN_COOLDOWN_SECONDS=$SCAN_COOLDOWN_SECONDS
 EZHIK_TEST_CLIENT=
 EZHIK_STATS_INTERVAL=60
 EZHIK_RAM_LOG_MAX_BYTES=8388608
 __SETTINGS_ENV__
 
-chmod 600 "$CONFIG_DIR/api.env" "$CONFIG_DIR/settings.env"
+chmod 600 "$CONFIG_DIR/api.env" "$CONFIG_DIR/telegram.env" "$CONFIG_DIR/settings.env"
 touch "$CONFIG_DIR/hold.txt"
 chmod 600 "$CONFIG_DIR/hold.txt"
 
@@ -1113,6 +1221,9 @@ cat <<__INSTALL_DONE__
  Remnawave panel     : $PANEL_URL
  Mode                : $MODE
  Freeze              : $FREEZE_MINUTES minute(s)
+ Port-scan mode      : $SCAN_MODE
+ Port-scan block     : $([ "$SCAN_BLOCK_MINUTES" -eq 0 ] && printf 'permanent' || printf '%s minute(s)' "$SCAN_BLOCK_MINUTES")
+ Telegram alerts     : $([ -n "$TELEGRAM_TOKEN" ] && printf 'enabled' || printf 'disabled')
  Protected IDs       : ${PROTECTED_CLIENTS:-none}
  Suricata            : ${SURI_VERSION:-8.0.6}
  strict nDPI plugin  : ${PLUGIN_SHA:0:16}...
@@ -1127,7 +1238,7 @@ cat <<__INSTALL_DONE__
 
  Installer log       : $INSTALL_LOG
 
- NOTE: v$APP_VERSION detects IPv4 BitTorrent traffic only.
+ NOTE: v$APP_VERSION detectors currently support IPv4 only.
 ============================================================
 __INSTALL_DONE__
 

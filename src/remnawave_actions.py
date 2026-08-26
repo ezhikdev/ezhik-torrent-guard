@@ -48,6 +48,13 @@ def _env_clients(name):
     return {item.strip() for item in raw.split(",") if item.strip().isdigit()}
 
 
+def _duration_value(value, default):
+    try:
+        return max(0, int(value))
+    except Exception:
+        return max(0, int(default))
+
+
 FREEZE_SECONDS = _env_int("EZHIK_FREEZE_SECONDS", 900)
 
 # API retry after temporary failure
@@ -400,6 +407,19 @@ def _load_state():
                 "last_error": str(
                     rec.get("last_error", "")
                 ),
+                "reason": str(
+                    rec.get("reason", "bittorrent")
+                ),
+                "duration_seconds": _duration_value(
+                    rec.get(
+                        "duration_seconds",
+                        FREEZE_SECONDS,
+                    ),
+                    FREEZE_SECONDS,
+                ),
+                "forget_after_disable": bool(
+                    rec.get("forget_after_disable", False)
+                ),
             }
 
         with _lock:
@@ -742,6 +762,9 @@ def _ensure_pending_freeze(client):
                 "ambiguous_since": None,
                 "last_disable_attempt_at": None,
                 "last_error": "",
+                "reason": "bittorrent",
+                "duration_seconds": FREEZE_SECONDS,
+                "forget_after_disable": False,
             }
 
             _pending_freezes[
@@ -843,9 +866,63 @@ def _confirm_frozen(
         now,
     )
 
+    with _lock:
+
+        pending = dict(
+            _pending_freezes.get(
+                client,
+                {},
+            )
+        )
+
+    reason = str(
+        pending.get(
+            "reason",
+            "bittorrent",
+        )
+    )
+    duration_seconds = _duration_value(
+        pending.get(
+            "duration_seconds",
+            FREEZE_SECONDS,
+        ),
+        FREEZE_SECONDS,
+    )
+    forget_after_disable = bool(
+        pending.get(
+            "forget_after_disable",
+            False,
+        )
+    )
+
+    if duration_seconds == 0 or forget_after_disable:
+
+        with _lock:
+
+            _pending_freezes.pop(
+                client,
+                None,
+            )
+
+            _save_state_locked()
+
+        print()
+        print(
+            f"[BLOCKED] "
+            f"client={client} "
+            f"duration=permanent "
+            f"reason={reason} "
+            f"manual_unblock=remnawave-panel "
+            f"source={source}",
+            flush=True,
+        )
+        print()
+
+        return
+
     unfreeze_at = (
         disabled_at
-        + FREEZE_SECONDS
+        + duration_seconds
     )
 
     record = {
@@ -854,7 +931,7 @@ def _confirm_frozen(
         "disabled_at": disabled_at,
         "unfreeze_at": unfreeze_at,
         "next_retry_at": unfreeze_at,
-        "reason": "bittorrent",
+        "reason": reason,
         "source": source,
     }
 
@@ -879,7 +956,8 @@ def _confirm_frozen(
     print(
         f"[FROZEN] "
         f"client={client} "
-        f"duration={FREEZE_SECONDS // 60}m "
+        f"duration={duration_seconds // 60}m "
+        f"reason={reason} "
         f"until={when.isoformat(timespec='seconds')} "
         f"source={source}",
         flush=True,
@@ -887,10 +965,33 @@ def _confirm_frozen(
     print()
 
 
-def queue_freeze(client):
+def queue_freeze(
+    client,
+    *,
+    duration_seconds=None,
+    reason="bittorrent",
+    forget_after_disable=False,
+):
 
     client = str(
         client
+    )
+
+    if duration_seconds is None:
+        duration_seconds = FREEZE_SECONDS
+
+    try:
+        duration_seconds = max(
+            0,
+            int(duration_seconds),
+        )
+    except Exception:
+        return False
+
+    reason = str(reason).strip() or "unknown"
+    forget_after_disable = bool(
+        forget_after_disable
+        or duration_seconds == 0
     )
 
     if not _write_allowed(
@@ -926,6 +1027,9 @@ def queue_freeze(client):
             "ambiguous_since": None,
             "last_disable_attempt_at": None,
             "last_error": "",
+            "reason": reason,
+            "duration_seconds": duration_seconds,
+            "forget_after_disable": forget_after_disable,
         }
 
         _queued.add(
@@ -944,7 +1048,9 @@ def queue_freeze(client):
     print(
         f"[ACTION QUEUED] "
         f"client={client} "
-        f"action=freeze",
+        f"action=freeze "
+        f"reason={reason} "
+        f"duration={'permanent' if duration_seconds == 0 else str(duration_seconds) + 's'}",
         flush=True,
     )
 

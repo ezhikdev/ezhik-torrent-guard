@@ -14,6 +14,8 @@ from collections import defaultdict, deque
 from functools import lru_cache
 
 import remnawave_actions as remna_actions
+import scan_detector
+import telegram_notifier
 
 
 def _app_version():
@@ -70,6 +72,18 @@ DRY_RUN = _env_bool("EZHIK_DRY_RUN", False)
 PROTECTED_CLIENTS = _env_clients("EZHIK_PROTECTED_CLIENTS")
 TEST_CLIENT = os.getenv("EZHIK_TEST_CLIENT", "").strip()
 
+SCAN_ENABLED = _env_bool("EZHIK_SCAN_ENABLED", True)
+SCAN_DRY_RUN = _env_bool("EZHIK_SCAN_DRY_RUN", True)
+SCAN_BLOCK_SECONDS = _env_int("EZHIK_SCAN_BLOCK_SECONDS", 3600, minimum=0)
+SCAN_WINDOW_SECONDS = _env_int("EZHIK_SCAN_WINDOW_SECONDS", 60)
+SCAN_BURST_WINDOW_SECONDS = _env_int("EZHIK_SCAN_BURST_WINDOW_SECONDS", 15)
+SCAN_VERTICAL_PORTS = _env_int("EZHIK_SCAN_VERTICAL_PORTS", 20, minimum=2)
+SCAN_BURST_ENDPOINTS = _env_int("EZHIK_SCAN_BURST_ENDPOINTS", 100, minimum=2)
+SCAN_BURST_PORTS = _env_int("EZHIK_SCAN_BURST_PORTS", 50, minimum=2)
+SCAN_SUBNET_HOSTS = _env_int("EZHIK_SCAN_SUBNET_HOSTS", 16, minimum=2)
+SCAN_SUBNET_PORTS = _env_int("EZHIK_SCAN_SUBNET_PORTS", 50, minimum=2)
+SCAN_COOLDOWN_SECONDS = _env_int("EZHIK_SCAN_COOLDOWN_SECONDS", 300)
+
 # Evidence window.
 WINDOW = 300
 
@@ -90,6 +104,17 @@ SOCKET_TTL = 180.0
 
 # Suricata может прислать alert немного раньше Xray mapping.
 PENDING_BT_TTL = 30.0
+
+SCAN_DETECTOR = scan_detector.ScanDetector(
+    window_seconds=SCAN_WINDOW_SECONDS,
+    burst_window_seconds=SCAN_BURST_WINDOW_SECONDS,
+    vertical_ports=SCAN_VERTICAL_PORTS,
+    burst_endpoints=SCAN_BURST_ENDPOINTS,
+    burst_ports=SCAN_BURST_PORTS,
+    subnet_hosts=SCAN_SUBNET_HOSTS,
+    subnet_ports=SCAN_SUBNET_PORTS,
+    cooldown_seconds=SCAN_COOLDOWN_SECONDS,
+)
 
 
 # ============================================================
@@ -176,6 +201,7 @@ stats = {
 
     "bt_alerts": 0,
     "bt_exact": 0,
+    "scan_alerts": 0,
 
     "ambiguous_request": 0,
     "ambiguous_socket": 0,
@@ -413,6 +439,11 @@ def bind_socket(rid):
     req["socket_key"] = key
 
     stats["bound_sockets"] += 1
+
+    process_scan_socket(
+        email,
+        key,
+    )
 
     # Возможно strict nDPI уже успел дать alert.
     pending_ts = pending_bt.get(key)
@@ -653,6 +684,78 @@ def process_info(line):
     stats["opened"] += 1
 
     bind_socket(rid)
+
+
+# ============================================================
+# PORT-SCAN EVIDENCE
+# ============================================================
+
+def process_scan_socket(client, key):
+
+    if not SCAN_ENABLED:
+        return
+
+    report = SCAN_DETECTOR.observe(
+        client,
+        key,
+    )
+
+    if report is None:
+        return
+
+    stats["scan_alerts"] += 1
+
+    if client in PROTECTED_CLIENTS:
+        action = "PROTECTED_NO_ACTION"
+
+    elif SCAN_DRY_RUN:
+        action = "WOULD_BLOCK"
+
+    else:
+        queued = remna_actions.queue_freeze(
+            client,
+            duration_seconds=SCAN_BLOCK_SECONDS,
+            reason="port-scan",
+            forget_after_disable=(SCAN_BLOCK_SECONDS == 0),
+        )
+        action = (
+            "BLOCK_QUEUED"
+            if queued
+            else "NO_ACTION_ALREADY_BLOCKED_OR_PENDING"
+        )
+
+    report.update(
+        {
+            "node_ip": LOCAL_IP,
+            "action": action,
+            "block_seconds": SCAN_BLOCK_SECONDS,
+        }
+    )
+
+    duration = (
+        "permanent"
+        if SCAN_BLOCK_SECONDS == 0
+        else f"{SCAN_BLOCK_SECONDS // 60}m"
+    )
+
+    print()
+    print(
+        f"[SCAN DETECTED] "
+        f"client={client} "
+        f"reason={report['reason']} "
+        f"window={report['window_seconds']}s "
+        f"endpoints={report['unique_endpoints']} "
+        f"ips={report['unique_ips']} "
+        f"ports={report['unique_ports']} "
+        f"action={action} "
+        f"duration={duration}",
+        flush=True,
+    )
+    print()
+
+    telegram_notifier.notify_scan(
+        report
+    )
 
 
 # ============================================================
@@ -1065,6 +1168,9 @@ def cleanup():
         if announced.get(client) == announced_ts:
             announced.pop(client, None)
 
+    if SCAN_ENABLED:
+        SCAN_DETECTOR.cleanup(now)
+
 
 # ============================================================
 # PRIVACY CLEANUP
@@ -1127,6 +1233,8 @@ def print_stats():
         f"bound={stats['bound_sockets']} "
         f"bt={stats['bt_alerts']} "
         f"exact={stats['bt_exact']} "
+        f"scan={stats['scan_alerts']} "
+        f"scan_clients={SCAN_DETECTOR.active_clients() if SCAN_ENABLED else 0} "
         f"pending={len(pending_bt)} "
         f"amb_req={stats['ambiguous_request']} "
         f"amb_sock={stats['ambiguous_socket']} "
@@ -1154,21 +1262,53 @@ def main():
     print(" MODE: " + ("DRY RUN" if DRY_RUN else "LIVE REMNAWAVE"))
     print()
     print(" Exact Xray socket <-> strict nDPI attribution")
+    print(
+        " Port-scan protection: "
+        + (
+            "DISABLED"
+            if not SCAN_ENABLED
+            else (
+                "OBSERVE"
+                if SCAN_DRY_RUN
+                else "LIVE REMNAWAVE"
+            )
+        )
+    )
     print()
     print(" Trigger: FIRST exact strict-nDPI BitTorrent socket")
     print()
     print(
-        " NO REMNAWAVE ACTIONS WILL BE SENT"
-        if DRY_RUN
-        else " REMNAWAVE ACTIONS ENABLED"
+        " Remnawave actions: "
+        + (
+            "ENABLED FOR AT LEAST ONE DETECTOR"
+            if (
+                not DRY_RUN
+                or (
+                    SCAN_ENABLED
+                    and not SCAN_DRY_RUN
+                )
+            )
+            else "DISABLED"
+        )
     )
     print(" Developer: ezhikdev | Telegram: @ezhikdev")
     print(" GitHub: https://github.com/ezhikdev")
     print("================================================")
     print()
 
-    if not DRY_RUN:
+    actions_enabled = (
+        not DRY_RUN
+        or (
+            SCAN_ENABLED
+            and not SCAN_DRY_RUN
+        )
+    )
+
+    if actions_enabled:
         remna_actions.start()
+
+    if SCAN_ENABLED:
+        telegram_notifier.start()
 
     start_readers()
 
@@ -1207,7 +1347,10 @@ def main():
             flush=True,
         )
 
-        if not DRY_RUN:
+        if SCAN_ENABLED:
+            telegram_notifier.stop()
+
+        if actions_enabled:
             remna_actions.stop()
 
         privacy_cleanup()
