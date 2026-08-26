@@ -88,11 +88,14 @@ def _action_label(action):
 def _target_lines(details):
     if "target_ip" in details:
         return [
+            f"Протокол: {str(details['target_protocol']).upper()}",
             f"Целевой IP: {details['target_ip']}",
             f"Уникальных портов цели: {details['target_unique_ports']}",
+            f"Порог срабатывания: {details['target_port_threshold']}",
         ]
     if "target_subnet" in details:
         return [
+            f"Протокол: {str(details['target_protocol']).upper()}",
             f"Целевая подсеть: {details['target_subnet']}",
             f"Уникальных адресов подсети: {details['subnet_unique_hosts']}",
             f"Уникальных портов подсети: {details['subnet_unique_ports']}",
@@ -216,12 +219,16 @@ def _send(report, file_path):
 
     if "target_ip" in details:
         caption_lines.append(
-            f"🎯 <b>Цель:</b> {html.escape(str(details['target_ip']))} · "
-            f"портов: <b>{int(details['target_unique_ports'])}</b>"
+            f"🎯 <b>Цель:</b> {html.escape(str(details['target_protocol']).upper())} "
+            f"{html.escape(str(details['target_ip']))} · "
+            f"портов: <b>{int(details['target_unique_ports'])}</b> / "
+            f"{int(details['target_port_threshold'])}"
         )
     elif "target_subnet" in details:
         caption_lines.append(
-            f"🎯 <b>Подсеть:</b> {html.escape(str(details['target_subnet']))} · "
+            f"🎯 <b>Подсеть:</b> "
+            f"{html.escape(str(details['target_protocol']).upper())} "
+            f"{html.escape(str(details['target_subnet']))} · "
             f"адресов: <b>{int(details['subnet_unique_hosts'])}</b> · "
             f"портов: <b>{int(details['subnet_unique_ports'])}</b> · "
             f"назначений: <b>{int(details['subnet_unique_endpoints'])}</b>"

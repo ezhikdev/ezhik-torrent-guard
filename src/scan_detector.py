@@ -13,10 +13,10 @@ class _Window:
         self.endpoints = Counter()
         self.ports = Counter()
         self.ips = Counter()
-        self.ip_ports = defaultdict(Counter)
-        self.subnet_ips = defaultdict(Counter)
-        self.subnet_ports = defaultdict(Counter)
-        self.subnet_endpoints = defaultdict(Counter)
+        self.protocol_ip_ports = defaultdict(Counter)
+        self.protocol_subnet_ips = defaultdict(Counter)
+        self.protocol_subnet_ports = defaultdict(Counter)
+        self.protocol_subnet_endpoints = defaultdict(Counter)
 
     @staticmethod
     def _decrement(counter, key):
@@ -36,29 +36,31 @@ class _Window:
             self._decrement(self.ports, remote_port)
             self._decrement(self.ips, remote_ip)
 
-            ip_ports = self.ip_ports.get(remote_ip)
+            protocol_ip = (endpoint[0], remote_ip)
+            ip_ports = self.protocol_ip_ports.get(protocol_ip)
             if ip_ports is not None:
                 self._decrement(ip_ports, remote_port)
                 if not ip_ports:
-                    self.ip_ports.pop(remote_ip, None)
+                    self.protocol_ip_ports.pop(protocol_ip, None)
 
-            subnet_ips = self.subnet_ips.get(subnet)
+            protocol_subnet = (endpoint[0], subnet)
+            subnet_ips = self.protocol_subnet_ips.get(protocol_subnet)
             if subnet_ips is not None:
                 self._decrement(subnet_ips, remote_ip)
                 if not subnet_ips:
-                    self.subnet_ips.pop(subnet, None)
+                    self.protocol_subnet_ips.pop(protocol_subnet, None)
 
-            subnet_ports = self.subnet_ports.get(subnet)
+            subnet_ports = self.protocol_subnet_ports.get(protocol_subnet)
             if subnet_ports is not None:
                 self._decrement(subnet_ports, remote_port)
                 if not subnet_ports:
-                    self.subnet_ports.pop(subnet, None)
+                    self.protocol_subnet_ports.pop(protocol_subnet, None)
 
-            subnet_endpoints = self.subnet_endpoints.get(subnet)
+            subnet_endpoints = self.protocol_subnet_endpoints.get(protocol_subnet)
             if subnet_endpoints is not None:
                 self._decrement(subnet_endpoints, endpoint)
                 if not subnet_endpoints:
-                    self.subnet_endpoints.pop(subnet, None)
+                    self.protocol_subnet_endpoints.pop(protocol_subnet, None)
 
     def add(self, now, proto, remote_ip, remote_port, subnet):
         self.expire(now)
@@ -71,17 +73,20 @@ class _Window:
         self.endpoints[endpoint] += 1
         self.ports[remote_port] += 1
         self.ips[remote_ip] += 1
-        self.ip_ports[remote_ip][remote_port] += 1
-        self.subnet_ips[subnet][remote_ip] += 1
-        self.subnet_ports[subnet][remote_port] += 1
-        self.subnet_endpoints[subnet][endpoint] += 1
+        protocol_ip = (proto, remote_ip)
+        protocol_subnet = (proto, subnet)
+        self.protocol_ip_ports[protocol_ip][remote_port] += 1
+        self.protocol_subnet_ips[protocol_subnet][remote_ip] += 1
+        self.protocol_subnet_ports[protocol_subnet][remote_port] += 1
+        self.protocol_subnet_endpoints[protocol_subnet][endpoint] += 1
 
     def empty(self):
         return not self.events
 
-    def sample_endpoints(self, limit=100):
+    def sample_endpoints(self, values=None, limit=100):
+        values = self.endpoints if values is None else values
         values = sorted(
-            self.endpoints,
+            values,
             key=lambda item: (item[0], ipaddress.ip_address(item[1]), item[2]),
         )
         return [
@@ -101,7 +106,8 @@ class ScanDetector:
         self,
         *,
         window_seconds=60,
-        vertical_ports=20,
+        tcp_vertical_ports=50,
+        udp_vertical_ports=100,
         subnet_hosts=16,
         subnet_ports=50,
         subnet_endpoints=100,
@@ -109,7 +115,8 @@ class ScanDetector:
         clock=time.time,
     ):
         self.window_seconds = max(1, int(window_seconds))
-        self.vertical_ports = max(2, int(vertical_ports))
+        self.tcp_vertical_ports = max(2, int(tcp_vertical_ports))
+        self.udp_vertical_ports = max(2, int(udp_vertical_ports))
         self.subnet_hosts = max(2, int(subnet_hosts))
         self.subnet_ports = max(2, int(subnet_ports))
         self.subnet_endpoints = max(2, int(subnet_endpoints))
@@ -145,18 +152,39 @@ class ScanDetector:
             self._clients[client] = state
         return state
 
-    def _report(self, client, reason, now, window, details):
+    def _report(self, client, reason, now, window, details, evidence):
+        evidence = set(evidence)
+        evidence_ips = {endpoint[1] for endpoint in evidence}
+        evidence_ports = {endpoint[2] for endpoint in evidence}
         self._announced[client] = now
         return {
             "client_id": client,
             "detected_at": now,
             "reason": reason,
             "window_seconds": int(window.seconds),
-            "unique_endpoints": len(window.endpoints),
-            "unique_ips": len(window.ips),
-            "unique_ports": len(window.ports),
+            "unique_endpoints": len(evidence),
+            "unique_ips": len(evidence_ips),
+            "unique_ports": len(evidence_ports),
             "details": details,
-            "sample_endpoints": window.sample_endpoints(),
+            "sample_endpoints": window.sample_endpoints(evidence),
+        }
+
+    @staticmethod
+    def _ip_evidence(window, proto, remote_ip):
+        return {
+            endpoint
+            for endpoint in window.endpoints
+            if endpoint[0] == proto and endpoint[1] == remote_ip
+        }
+
+    @staticmethod
+    def _subnet_evidence(window, proto, subnet):
+        network = ipaddress.ip_network(subnet)
+        return {
+            endpoint
+            for endpoint in window.endpoints
+            if endpoint[0] == proto
+            and ipaddress.ip_address(endpoint[1]) in network
         }
 
     def observe(self, client, socket_key, now=None):
@@ -188,38 +216,55 @@ class ScanDetector:
         long_window = state["long"]
         long_window.add(now, proto, str(address), remote_port, subnet)
 
-        vertical_count = len(long_window.ip_ports[str(address)])
-        if vertical_count >= self.vertical_ports:
+        remote_ip = str(address)
+        protocol_ip = (proto, remote_ip)
+        vertical_count = len(long_window.protocol_ip_ports[protocol_ip])
+        vertical_threshold = (
+            self.tcp_vertical_ports
+            if proto == "tcp"
+            else self.udp_vertical_ports
+        )
+        if vertical_count >= vertical_threshold:
+            evidence = self._ip_evidence(long_window, proto, remote_ip)
             return self._report(
                 client,
                 "vertical-port-scan",
                 now,
                 long_window,
                 {
-                    "target_ip": str(address),
+                    "target_protocol": proto,
+                    "target_ip": remote_ip,
                     "target_unique_ports": vertical_count,
+                    "target_port_threshold": vertical_threshold,
                 },
+                evidence,
             )
 
-        subnet_host_count = len(long_window.subnet_ips[subnet])
-        subnet_port_count = len(long_window.subnet_ports[subnet])
-        subnet_endpoint_count = len(long_window.subnet_endpoints[subnet])
+        protocol_subnet = (proto, subnet)
+        subnet_host_count = len(long_window.protocol_subnet_ips[protocol_subnet])
+        subnet_port_count = len(long_window.protocol_subnet_ports[protocol_subnet])
+        subnet_endpoint_count = len(
+            long_window.protocol_subnet_endpoints[protocol_subnet]
+        )
         if (
             subnet_host_count >= self.subnet_hosts
             and subnet_port_count >= self.subnet_ports
             and subnet_endpoint_count >= self.subnet_endpoints
         ):
+            evidence = self._subnet_evidence(long_window, proto, subnet)
             return self._report(
                 client,
                 "subnet-port-scan",
                 now,
                 long_window,
                 {
+                    "target_protocol": proto,
                     "target_subnet": subnet,
                     "subnet_unique_hosts": subnet_host_count,
                     "subnet_unique_ports": subnet_port_count,
                     "subnet_unique_endpoints": subnet_endpoint_count,
                 },
+                evidence,
             )
 
         return None
