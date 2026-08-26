@@ -27,7 +27,6 @@ _chat_id = None
 REASON_LABELS = {
     "vertical-port-scan": "Перебор портов одного IP-адреса",
     "subnet-port-scan": "Сканирование адресов одной подсети /24",
-    "distributed-port-scan": "Распределённое сканирование адресов и портов",
 }
 
 ACTION_LABELS = {
@@ -97,11 +96,7 @@ def _target_lines(details):
             f"Целевая подсеть: {details['target_subnet']}",
             f"Уникальных адресов подсети: {details['subnet_unique_hosts']}",
             f"Уникальных портов подсети: {details['subnet_unique_ports']}",
-        ]
-    if "burst_unique_endpoints" in details:
-        return [
-            f"Назначений во всплеске: {details['burst_unique_endpoints']}",
-            f"Уникальных портов во всплеске: {details['burst_unique_ports']}",
+            f"Уникальных назначений подсети: {details['subnet_unique_endpoints']}",
         ]
     return []
 
@@ -228,7 +223,8 @@ def _send(report, file_path):
         caption_lines.append(
             f"🎯 <b>Подсеть:</b> {html.escape(str(details['target_subnet']))} · "
             f"адресов: <b>{int(details['subnet_unique_hosts'])}</b> · "
-            f"портов: <b>{int(details['subnet_unique_ports'])}</b>"
+            f"портов: <b>{int(details['subnet_unique_ports'])}</b> · "
+            f"назначений: <b>{int(details['subnet_unique_endpoints'])}</b>"
         )
 
     caption_lines.extend(

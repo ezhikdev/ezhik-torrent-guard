@@ -16,6 +16,7 @@ class _Window:
         self.ip_ports = defaultdict(Counter)
         self.subnet_ips = defaultdict(Counter)
         self.subnet_ports = defaultdict(Counter)
+        self.subnet_endpoints = defaultdict(Counter)
 
     @staticmethod
     def _decrement(counter, key):
@@ -53,6 +54,12 @@ class _Window:
                 if not subnet_ports:
                     self.subnet_ports.pop(subnet, None)
 
+            subnet_endpoints = self.subnet_endpoints.get(subnet)
+            if subnet_endpoints is not None:
+                self._decrement(subnet_endpoints, endpoint)
+                if not subnet_endpoints:
+                    self.subnet_endpoints.pop(subnet, None)
+
     def add(self, now, proto, remote_ip, remote_port, subnet):
         self.expire(now)
 
@@ -67,6 +74,7 @@ class _Window:
         self.ip_ports[remote_ip][remote_port] += 1
         self.subnet_ips[subnet][remote_ip] += 1
         self.subnet_ports[subnet][remote_port] += 1
+        self.subnet_endpoints[subnet][endpoint] += 1
 
     def empty(self):
         return not self.events
@@ -93,22 +101,18 @@ class ScanDetector:
         self,
         *,
         window_seconds=60,
-        burst_window_seconds=15,
         vertical_ports=20,
-        burst_endpoints=100,
-        burst_ports=50,
         subnet_hosts=16,
         subnet_ports=50,
+        subnet_endpoints=100,
         cooldown_seconds=300,
         clock=time.time,
     ):
         self.window_seconds = max(1, int(window_seconds))
-        self.burst_window_seconds = max(1, int(burst_window_seconds))
         self.vertical_ports = max(2, int(vertical_ports))
-        self.burst_endpoints = max(2, int(burst_endpoints))
-        self.burst_ports = max(2, int(burst_ports))
         self.subnet_hosts = max(2, int(subnet_hosts))
         self.subnet_ports = max(2, int(subnet_ports))
+        self.subnet_endpoints = max(2, int(subnet_endpoints))
         self.cooldown_seconds = max(1, int(cooldown_seconds))
         self.clock = clock
 
@@ -137,7 +141,6 @@ class ScanDetector:
         if state is None:
             state = {
                 "long": _Window(self.window_seconds),
-                "burst": _Window(self.burst_window_seconds),
             }
             self._clients[client] = state
         return state
@@ -183,10 +186,7 @@ class ScanDetector:
         subnet = self._subnet(address)
         state = self._state(client)
         long_window = state["long"]
-        burst_window = state["burst"]
-
-        for window in (long_window, burst_window):
-            window.add(now, proto, str(address), remote_port, subnet)
+        long_window.add(now, proto, str(address), remote_port, subnet)
 
         vertical_count = len(long_window.ip_ports[str(address)])
         if vertical_count >= self.vertical_ports:
@@ -203,9 +203,11 @@ class ScanDetector:
 
         subnet_host_count = len(long_window.subnet_ips[subnet])
         subnet_port_count = len(long_window.subnet_ports[subnet])
+        subnet_endpoint_count = len(long_window.subnet_endpoints[subnet])
         if (
             subnet_host_count >= self.subnet_hosts
             and subnet_port_count >= self.subnet_ports
+            and subnet_endpoint_count >= self.subnet_endpoints
         ):
             return self._report(
                 client,
@@ -216,21 +218,7 @@ class ScanDetector:
                     "target_subnet": subnet,
                     "subnet_unique_hosts": subnet_host_count,
                     "subnet_unique_ports": subnet_port_count,
-                },
-            )
-
-        if (
-            len(burst_window.endpoints) >= self.burst_endpoints
-            and len(burst_window.ports) >= self.burst_ports
-        ):
-            return self._report(
-                client,
-                "distributed-port-scan",
-                now,
-                burst_window,
-                {
-                    "burst_unique_endpoints": len(burst_window.endpoints),
-                    "burst_unique_ports": len(burst_window.ports),
+                    "subnet_unique_endpoints": subnet_endpoint_count,
                 },
             )
 
@@ -267,8 +255,7 @@ class ScanDetector:
 
         for client, state in list(self._clients.items()):
             state["long"].expire(now)
-            state["burst"].expire(now)
-            if state["long"].empty() and state["burst"].empty():
+            if state["long"].empty():
                 self._clients.pop(client, None)
 
         for client, announced_at in list(self._announced.items()):

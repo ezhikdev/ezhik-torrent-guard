@@ -7,7 +7,7 @@
 Developer : ezhikdev
 Telegram  : @ezhikdev
 GitHub    : https://github.com/ezhikdev
-Version   : 1.2.2
+Version   : 1.2.3
 ```
 
 Guard связывает сетевое нарушение с точным числовым ID авторизованного клиента
@@ -61,13 +61,17 @@ Port Guard анализирует уже существующие access-соб�
 Триггеры по умолчанию:
 
 - `20` разных портов одного IP за `60` секунд;
-- `16` адресов одной `/24` и `50` разных портов за `60` секунд;
-- `100` уникальных `IP:port` и `50` разных портов за `15` секунд.
+- `16` адресов одной `/24`, `50` разных портов и `100` уникальных назначений
+  внутри этой подсети за `60` секунд.
 
 Повтор одного назначения не увеличивает счётчик. Обычное большое количество
 HTTPS/QUIC-соединений только к порту `443` не достигает порога разнообразия
 портов. После события действует cooldown `300` секунд для подавления повторных
 уведомлений по тому же клиенту.
+
+Случайный fan-out по множеству несвязанных IP не считается сканированием сам по
+себе: такой профиль характерен для BitTorrent peer/DHT traffic и без анализа
+протокола неоднозначен. Его классифицирует отдельный strict nDPI Torrent Guard.
 
 Режимы Port Guard:
 
@@ -160,7 +164,7 @@ journalctl -u ezhik-torrent-guard --since "1 hour ago" --no-pager | \
 Текущая конфигурация Port Guard:
 
 ```bash
-grep -E '^EZHIK_SCAN_(ENABLED|DRY_RUN|BLOCK_SECONDS|WINDOW_SECONDS|VERTICAL_PORTS|COOLDOWN_SECONDS)=' \
+grep -E '^EZHIK_SCAN_(ENABLED|DRY_RUN|BLOCK_SECONDS|WINDOW_SECONDS|VERTICAL_PORTS|SUBNET_(HOSTS|PORTS|ENDPOINTS)|COOLDOWN_SECONDS)=' \
   /etc/ezhik-torrent-guard/settings.env
 ```
 
