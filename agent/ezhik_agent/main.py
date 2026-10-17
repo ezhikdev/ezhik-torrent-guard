@@ -446,7 +446,7 @@ class Agent:
             return False
 
     def reconcile_site(self, desired):
-        if ((desired.get("nginx") or {}).get("mode") or "direct") != "frontend":
+        if ((desired.get("nginx") or {}).get("mode") or "direct") not in ("frontend", "vision"):
             return None
         wanted = desired.get("site")
         if not wanted:
@@ -467,7 +467,24 @@ class Agent:
     def reconcile_nginx(self, desired):
         cfg = desired.get("nginx") or {"mode": "direct"}
         network = nginx.container_network(self.detector.config.container or "remnanode")
-        return self.nginx.apply(cfg, desired.get("cert_target") or {}, network, self.state)
+        was_ready = self.nginx.last.get("mode") == "vision" and self.nginx.last.get("fallback_ok")
+        try:
+            return self.nginx.apply(cfg, desired.get("cert_target") or {}, network, self.state)
+        finally:
+            if cfg.get("mode") == "vision" and self.nginx.last.get("fallback_ok") and not was_ready:
+                # Port 443 is free now: tell the panel at once so a confirmed Remnawave
+                # sync starts without waiting for the next long-poll round.
+                threading.Thread(target=self.push_report, name="push-report", daemon=True).start()
+
+    def push_report(self):
+        try:
+            body = self.report()
+            body.update({"push": True, "wait": 0, "acks": []})
+            body.pop("update_report", None)
+            body.pop("diagnostics", None)
+            self.client.request("POST", "/agent/v1/sync", body, timeout=30)
+        except Exception as exc:
+            log.warning("Out-of-band report failed: %s", short_error(exc, 120))
 
     def services_snapshot(self):
         at, cached = self.ports_cache

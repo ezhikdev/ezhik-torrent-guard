@@ -8,7 +8,7 @@
 Developer : ezhikdev
 Telegram  : @ezhikdev
 GitHub    : https://github.com/ezhikdev
-Version   : 2.1
+Version   : 2.2
 ```
 
 Ezhik Guard объединяет **Ezhik Torrent Guard 1.x** и **Ezhik SSL Manager**. Нарушение
@@ -63,7 +63,7 @@ Ezhik Guard объединяет **Ezhik Torrent Guard 1.x** и **Ezhik SSL Mana
   диапазоны, IPv4/IPv6, CIDR; автообнаружение портов Xray/RemnaNode/Nginx/Docker
   с политиками «открыт / белый список / закрыт»; своя таблица nftables, проверка
   `nft -c`, защита SSH, автоматический откат при потере связи с панелью;
-- **Nginx Manager**: режим ноды Direct (как раньше) или Frontend — Nginx на 80/443,
+- **Nginx Manager**: режим ноды Direct (как раньше), Vision + TLS Fallback (2.2) или Frontend — Nginx на 80/443,
   TLS 1.2/1.3, 301 на HTTPS, сайт-заглушка и маршруты gRPC (`grpc_pass`),
   WebSocket, HTTPUpgrade, XHTTP во внутренние inbound'ы Xray; проверка
   совместимости с inbound'ами Remnawave и синхронизация одного inbound'а
@@ -195,6 +195,51 @@ TCP 22, 80, 443) и политики для обнаруженных порто�
 **только этот inbound** (`listen`, `port`, `security: none`,
 `serviceName`/`path`) через API Remnawave — подписки пересоберёт сама Remnawave.
 REALITY и смена транспорта автоматически не выполняются.
+
+## Vision + TLS Fallback
+
+Третий режим Nginx (с 2.2): **Xray принимает TLS на 443** (VLESS RAW + TLS +
+XTLS Vision), а всё, что не является VLESS, через fallbacks Xray попадает в
+Nginx на локальных портах. Корректные клиенты с `flow: xtls-rprx-vision` получают
+туннель, обычный браузер — сайт-заглушку с сертификатом ноды.
+
+```text
+клиент VLESS Vision ─┐                    ┌─► туннель (inbound Vision)
+браузер (h2 / 1.1) ──┼─► Xray :443 (TLS) ─┤
+gRPC / WS клиенты ───┘                    └─► fallback ─► Nginx 127.0.0.1:8001 (HTTP/1.1)
+                                                          Nginx 127.0.0.1:8002 (h2c)
+                                                            ├─ сайт-заглушка
+                                                            └─ маршруты gRPC/WS/XHTTP → Xray
+```
+
+- Для Vision нужен **отдельный VLESS inbound** (RAW, не REALITY) в профиле
+  Remnawave. REALITY и inbound'ы gRPC/WS/XHTTP не меняются; маршруты Nginx на
+  443 продолжают работать через fallback (gRPC — через HTTP/2).
+- Сертификат — из SSL Manager. Xray читает его **внутри контейнера RemnaNode**
+  (`/etc/xray/ssl/…` по умолчанию), поэтому установка сертификата должна быть
+  «в Docker-контейнер» (или каталог смонтирован). Агент проверяет это до
+  любых изменений.
+- Посетители получают HTTP/1.1 и HTTP/2 (ALPN `h2, http/1.1`), Nginx видит их
+  реальный IP через PROXY protocol (`xver 1`); порт 80 отдаёт 301.
+
+Как включить: страница ноды → «Nginx» → **Vision + TLS**, выбрать inbound →
+«Синхронизировать с Remnawave», посмотреть «было/станет» и подтвердить.
+Порядок безопасный: агент проверяет порты, сеть контейнера (нужна `host`) и
+сертификат, переводит Nginx на локальные порты (`nginx -t`, проверка ответов,
+откат при ошибке); изменение inbound в Remnawave выполняется только после
+этого (можно подтвердить заранее — оно запустится, как только агент будет
+готов). Порт 443 недоступен около 10 секунд, пока RemnaNode перезапускает Xray.
+
+Изменяется только выбранный inbound: `listen 0.0.0.0`, `port 443`,
+`security: tls` с сертификатом, `alpn`, `flow: xtls-rprx-vision`, `fallbacks`,
+`decryption: none`. Клиенты, sniffing и другие ключи остаются. Если inbound
+активен ещё на других нодах общего профиля — автоматическое изменение
+запрещено (оно затронуло бы их). Если inbound раньше был без TLS, клиентам
+нужно обновить подписку.
+
+Обратно: Vision → Direct — Nginx отключается, VPN продолжает работать, сайт
+перестаёт отвечать. Vision → Frontend — сначала уберите inbound Vision с 443 в
+Remnawave, иначе агент откажется (порт занят Xray) и оставит Vision работать.
 
 ## Сайты-заглушки
 
@@ -348,6 +393,8 @@ bash /opt/ezhik-guard/panel/current/uninstall.sh --panel   # панель (с р
 - поведенческие детекторы срабатывают по порогу: первые запросы проходят;
 - ручной DNS-режим сертификатов требует ваших действий при каждом продлении —
   для автоматики используйте Cloudflare или acme-dns;
+- режим Vision требует RemnaNode в сети `host` (fallback идёт на 127.0.0.1) и
+  отдельный VLESS inbound; в общем профиле Remnawave его нужно настроить вручную;
 - Nginx Frontend и HTTPS панели на порту 443 на одном сервере конфликтуют за
   80/443 — используйте для панели порт 8443 и DNS-01;
 - через Nginx проходят только gRPC, WebSocket, HTTPUpgrade и XHTTP; REALITY и RAW

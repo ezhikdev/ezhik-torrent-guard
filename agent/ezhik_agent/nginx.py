@@ -1,10 +1,16 @@
-"""Nginx frontend in front of Xray (per-node mode "frontend").
+"""Nginx in front of / behind Xray (per-node Nginx mode).
 
-Direct mode leaves Nginx alone (or stops the Nginx we installed ourselves).
-Frontend mode writes one managed file, validates it with ``nginx -t``,
-reloads, verifies real responses and restores the previous state on any
-failure. Foreign Nginx configs are never edited; the stock Ubuntu default
-site is disabled (and restored later) only because it would claim port 80.
+* direct   — Nginx is left alone (or the Nginx we installed is stopped);
+* frontend — Nginx terminates TLS on 443 and proxies HTTP transports to Xray;
+* vision   — Xray terminates TLS on 443 (VLESS RAW + TLS + XTLS Vision) and its
+  fallbacks hand ordinary HTTPS visitors to Nginx on local ports
+  (HTTP/1.1 and h2c, PROXY protocol), which serves the stub site and the
+  HTTP routes of port 443.
+
+Every apply writes one managed file, validates it with ``nginx -t``, reloads,
+verifies real responses and restores the previous state on any failure.
+Foreign Nginx configs are never edited; the stock Ubuntu default site is
+disabled (and restored later) only because it would claim port 80.
 """
 
 import logging
@@ -113,27 +119,38 @@ def _location(route):
     }}"""
 
 
-def render(cfg, cert_file, key_file):
-    routes = [r for r in cfg.get("routes") or [] if r.get("enabled", True)]
+def _routes_by_port(cfg):
     by_port = {}
-    for route in routes:
-        port, block = _location(route)
-        by_port.setdefault(port, []).append(block)
-    https_ports = sorted(set(by_port) | {443})
+    for route in cfg.get("routes") or []:
+        if route.get("enabled", True):
+            port, block = _location(route)
+            by_port.setdefault(port, []).append(block)
+    return by_port
+
+
+def _server_name(cfg):
     server_name = cfg.get("server_name") or "_"
     if server_name != "_" and not re.fullmatch(r"[A-Za-z0-9.*-]{1,253}", server_name):
         raise NginxError("недопустимое имя сервера")
-    root = SITE_ROOT / "current"
-    out = ["# Managed by Ezhik Guard agent. Manual changes are overwritten.", ""]
-    if cfg.get("http_redirect", True):
-        out.append("""server {
+    return server_name
+
+
+REDIRECT_SERVER = """server {
     listen 80 default_server;
     listen [::]:80 default_server;
     server_name _;
     location / { return 301 https://$host$request_uri; }
-}""")
-    for port in https_ports:
-        out.append(f"""
+}"""
+
+SITE_LOCATION = """
+    # Everything else is the stub site.
+    location / {
+        try_files $uri $uri/ $uri.html /index.html;
+    }"""
+
+
+def _tls_server(port, server_name, cert_file, key_file, blocks):
+    return f"""
 server {{
     listen {port} ssl http2 default_server;
     listen [::]:{port} ssl http2 default_server;
@@ -149,15 +166,66 @@ server {{
 
     server_tokens off;
     add_header X-Content-Type-Options nosniff always;
-    root {root};
+    root {SITE_ROOT / "current"};
     index index.html index.htm;
-{''.join(by_port.get(port, []))}
+{''.join(blocks)}
+{SITE_LOCATION}
+}}"""
 
-    # Everything else is the stub site.
-    location / {{
-        try_files $uri $uri/ $uri.html /index.html;
-    }}
+
+def render(cfg, cert_file, key_file):
+    by_port = _routes_by_port(cfg)
+    server_name = _server_name(cfg)
+    out = ["# Managed by Ezhik Guard agent. Manual changes are overwritten.", ""]
+    if cfg.get("http_redirect", True):
+        out.append(REDIRECT_SERVER)
+    for port in sorted(set(by_port) | {443}):
+        out.append(_tls_server(port, server_name, cert_file, key_file, by_port.get(port, [])))
+    return "\n".join(out) + "\n"
+
+
+def vision_settings(cfg):
+    vision = dict(cfg.get("vision") or {})
+    vision.setdefault("http1_port", 8001)
+    vision.setdefault("h2_port", 8002)
+    vision.setdefault("h2", True)
+    vision.setdefault("proxy_protocol", True)
+    for key in ("http1_port", "h2_port"):
+        if not 1024 <= int(vision[key]) <= 65535:
+            raise NginxError("локальные порты fallback: 1024–65535")
+    return vision
+
+
+def render_vision(cfg, cert_file, key_file):
+    """Xray owns 443; its fallbacks reach this config on 127.0.0.1 only."""
+    vision = vision_settings(cfg)
+    by_port = _routes_by_port(cfg)
+    server_name = _server_name(cfg)
+    pp = " proxy_protocol" if vision["proxy_protocol"] else ""
+    listens = [f"    listen 127.0.0.1:{vision['http1_port']}{pp} default_server;"]
+    if vision["h2"]:
+        listens.append(f"    listen 127.0.0.1:{vision['h2_port']} http2{pp} default_server;")
+    real_ip = ("\n    # Real visitor address from Xray (fallback xver 1).\n"
+               "    set_real_ip_from 127.0.0.1;\n    real_ip_header proxy_protocol;") if vision["proxy_protocol"] else ""
+    out = ["# Managed by Ezhik Guard agent. Manual changes are overwritten.",
+           "# Mode: VLESS RAW + TLS + XTLS Vision on Xray :443, fallbacks -> this Nginx.", ""]
+    if cfg.get("http_redirect", True):
+        out.append(REDIRECT_SERVER)
+    out.append(f"""
+# Fallback target for Xray :443 (TLS is already terminated by Xray).
+server {{
+{chr(10).join(listens)}
+    server_name _;{real_ip}
+
+    server_tokens off;
+    add_header X-Content-Type-Options nosniff always;
+    root {SITE_ROOT / "current"};
+    index index.html index.htm;
+{''.join(by_port.get(443, []))}
+{SITE_LOCATION}
 }}""")
+    for port in sorted(p for p in by_port if p != 443):
+        out.append(_tls_server(port, server_name, cert_file, key_file, by_port[port]))
     return "\n".join(out) + "\n"
 
 
@@ -241,6 +309,48 @@ def _probe(port, path="/", grpc=False, timeout=6):
     return int(match.group(1)) if match else 0
 
 
+def _curl_code(args, timeout=8):
+    """(status, http_version) of a curl request; (0, "") when it failed."""
+    result = run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code} %{http_version}", "--max-time", str(timeout),
+                  *args], timeout=timeout + 5)
+    parts = (result.stdout or "").split()
+    if len(parts) == 2 and parts[0].isdigit():
+        return int(parts[0]), parts[1]
+    return 0, ""
+
+
+def probe_fallback(port, proxy_protocol, h2):
+    args = ["--haproxy-protocol"] if proxy_protocol else []
+    args += ["--http2-prior-knowledge"] if h2 else ["--http1.1"]
+    return _curl_code(args + [f"http://127.0.0.1:{port}/"])
+
+
+def probe_vision_443(server_name, alpn_h2):
+    """Ordinary HTTPS visitor through Xray :443 -> fallback -> Nginx."""
+    host = server_name if server_name and server_name != "_" and "*" not in server_name else "localhost"
+    return _curl_code(["-k", "--resolve", f"{host}:443:127.0.0.1", "--http2" if alpn_h2 else "--http1.1",
+                       f"https://{host}/"])
+
+
+def cert_in_container(cert_target, network=None):
+    """True/False when the Xray container can read the node certificate; None if unknown."""
+    try:
+        cfg = certs.target_config(cert_target)
+    except Exception:
+        return None
+    check = run(["docker", "inspect", "--format", "{{.State.Running}}", cfg["container"]], timeout=20)
+    if check.returncode != 0:
+        # No container (systemd Xray): the host files are what Xray reads.
+        host = paths.p(cfg["dir"])
+        return (host / "fullchain.pem").exists() and (host / "privkey.pem").exists()
+    if check.stdout.strip() != "true":
+        return None
+    result = run(["docker", "exec", cfg["container"], "sh", "-c",
+                  f"test -r {cfg['container_dir']}/fullchain.pem && test -r {cfg['container_dir']}/privkey.pem"],
+                 timeout=20)
+    return result.returncode == 0
+
+
 def _tcp_open(host, port, timeout=3):
     try:
         with socket.create_connection((host.strip("[]"), port), timeout=timeout):
@@ -270,6 +380,9 @@ class NginxManager:
         mode = (cfg or {}).get("mode") or "direct"
         if mode == "frontend":
             return self._frontend(cfg, cert_target, container_network, state)
+        if mode == "vision":
+            return self._vision(cfg, cert_target, container_network, state)
+        self.last = {"mode": "direct", "at": time.time()}
         return self._direct(state)
 
     def _direct(self, state):
@@ -314,27 +427,55 @@ class NginxManager:
                 busy.append(f"{port} ({owner['process'] or owner['role']})")
         if busy:
             raise NginxError("порты заняты другими процессами: " + ", ".join(busy)
-                             + ". Для Xray переведите inbound на внутренний адрес/порт.")
+                             + ". Для Xray переведите inbound на внутренний адрес/порт"
+                             + (" (если это inbound режима Vision — сначала уберите его с 443 в Remnawave)"
+                                if any(b.startswith("443 ") for b in busy) else "") + ".")
         conflicts = foreign_listeners(set(wanted))
         if conflicts and not cfg.get("force"):
             raise NginxError("другие конфигурации Nginx уже слушают эти порты: "
                              + ", ".join(f"{p} в {f}" for p, f in conflicts))
 
-        cert_dir = paths.p(certs.target_config(cert_target).get("dir", "/etc/xray/ssl"))
-        cert_file, key_file = cert_dir / "fullchain.pem", cert_dir / "privkey.pem"
-        tls_note = ""
-        if not (cert_file.exists() and key_file.exists()):
-            cert_file, key_file = ensure_selfsigned()
-            tls_note = " · временный самоподписанный сертификат"
+        cert_file, key_file, tls_note = self._tls_files(cert_target)
         site.ensure_default()
-
         text = render(cfg, cert_file, key_file)
-        import hashlib
-
-        digest = hashlib.sha256((text + str(cert_file.stat().st_mtime)).encode()).hexdigest()[:16]
+        digest = _digest(text, cert_file)
         if CONF.exists() and state.get("nginx_hash") == digest and system.unit_active("nginx.service"):
             return f"frontend: {len(routes)} маршрут(ов){tls_note}"
 
+        def verify():
+            checks = []
+            status = _probe(443)
+            if status not in (200, 301, 302, 403):
+                raise NginxError(f"заглушка на 443 ответила HTTP {status}")
+            checks.append(f"443 → {status}")
+            for route in routes:
+                reachable = _tcp_open(str(route.get("upstream_host") or "127.0.0.1"), int(route["upstream_port"]))
+                if route["transport"] == "grpc":
+                    code = _probe(int(route.get("public_port") or 443), f"/{route['service_name']}/Tun", grpc=True)
+                    checks.append(f"grpc {route['service_name']}: HTTP {code}, upstream "
+                                  f"{'ok' if reachable else 'Xray не слушает внутренний порт'}")
+                else:
+                    checks.append(f"{route['transport']} {route['path']}: upstream {'ok' if reachable else 'не отвечает'}")
+            return checks
+
+        checks = self._install(text, cfg, verify)
+        state["nginx_hash"] = digest
+        self.last = {"mode": "frontend", "checks": checks, "at": time.time()}
+        log.info("Nginx frontend applied: %s", "; ".join(checks))
+        return f"frontend: {len(routes)} маршрут(ов){tls_note}"
+
+    # shared ----------------------------------------------------------
+
+    def _tls_files(self, cert_target):
+        cert_dir = paths.p(certs.target_config(cert_target).get("dir", "/etc/xray/ssl"))
+        cert_file, key_file = cert_dir / "fullchain.pem", cert_dir / "privkey.pem"
+        if cert_file.exists() and key_file.exists():
+            return cert_file, key_file, ""
+        cert_file, key_file = ensure_selfsigned()
+        return cert_file, key_file, " · временный самоподписанный сертификат"
+
+    def _install(self, text, cfg, verify):
+        """Write the managed config, reload, verify; restore the previous state on failure."""
         backup = STATE_DIR / "conf.backup"
         had_conf = CONF.exists()
         if had_conf:
@@ -371,29 +512,112 @@ class NginxManager:
         if result.returncode != 0:
             rollback("Nginx не перезапустился: " + system.unit_failure_hint("nginx.service"))
         time.sleep(1)
-        checks = []
         try:
-            status = _probe(443)
-            if status not in (200, 301, 302, 403):
-                rollback(f"заглушка на 443 ответила HTTP {status}")
-            checks.append(f"443 → {status}")
-            for route in routes:
-                if route["transport"] == "grpc":
-                    code = _probe(int(route.get("public_port") or 443), f"/{route['service_name']}/Tun", grpc=True)
-                    reachable = _tcp_open(str(route.get("upstream_host") or "127.0.0.1"), int(route["upstream_port"]))
-                    route_state = "ok" if reachable else "Xray не слушает внутренний порт"
-                    checks.append(f"grpc {route['service_name']}: HTTP {code}, upstream {route_state}")
-                else:
-                    reachable = _tcp_open(str(route.get("upstream_host") or "127.0.0.1"), int(route["upstream_port"]))
-                    checks.append(f"{route['transport']} {route['path']}: upstream {'ok' if reachable else 'не отвечает'}")
-        except NginxError:
-            raise
+            return verify()
+        except NginxError as exc:
+            rollback(str(exc))
         except Exception as exc:
-            rollback(f"проверка HTTPS не прошла: {exc}")
-        state["nginx_hash"] = digest
-        self.last = {"checks": checks, "at": time.time()}
-        log.info("Nginx frontend applied: %s", "; ".join(checks))
-        return f"frontend: {len(routes)} маршрут(ов){tls_note}"
+            rollback(f"проверка не прошла: {exc}")
+
+    # vision ----------------------------------------------------------
+
+    def _vision(self, cfg, cert_target, container_network, state):
+        vision = vision_settings(cfg)
+        routes = [r for r in cfg.get("routes") or [] if r.get("enabled", True)]
+        for route in routes:
+            validate_route(route)
+        if container_network and container_network != "host":
+            raise NginxError(f"контейнер RemnaNode в сети {container_network!r}: fallback Xray на 127.0.0.1 "
+                             "не дойдёт до Nginx. Нужна сеть host (как в стандартной установке RemnaNode).")
+        # The Xray inbound will read the certificate inside the container: check before touching anything.
+        in_container = cert_in_container(cert_target, container_network)
+        self.last = {**self.last, "mode": "vision", "cert_in_container": in_container}
+        if in_container is False:
+            ccfg = certs.target_config(cert_target)
+            raise NginxError(f"сертификата нет внутри контейнера {ccfg['container']} ({ccfg['container_dir']}). "
+                             "Назначьте сертификат ноде и выберите установку в Docker-контейнер.")
+        if not installed():
+            system.ensure_packages(["nginx"])
+            self.marker_installed.write_text("1", encoding="utf-8")
+        public = sorted({int(r.get("public_port") or 443) for r in routes} - {443}
+                        | ({80} if cfg.get("http_redirect", True) else set()))
+        local = [vision["http1_port"]] + ([vision["h2_port"]] if vision["h2"] else [])
+        busy = []
+        for port in public + local:
+            owner = ports.port_busy(port, "tcp", ignore_roles=("nginx",))
+            if owner:
+                busy.append(f"{port} ({owner['process'] or owner['role']})")
+        owner443 = ports.port_busy(443, "tcp", ignore_roles=("nginx", "xray"))
+        if owner443:
+            busy.append(f"443 ({owner443['process'] or owner443['role']})")
+        if busy:
+            raise NginxError("порты заняты другими процессами: " + ", ".join(busy))
+        conflicts = foreign_listeners(set(public + local))
+        if conflicts and not cfg.get("force"):
+            raise NginxError("другие конфигурации Nginx уже слушают эти порты: "
+                             + ", ".join(f"{p} в {f}" for p, f in conflicts))
+
+        cert_file, key_file, _note = self._tls_files(cert_target)
+        site.ensure_default()
+        text = render_vision(cfg, cert_file, key_file)
+        digest = _digest(text, cert_file)
+
+        def verify():
+            checks = []
+            code, version = probe_fallback(vision["http1_port"], vision["proxy_protocol"], False)
+            if code not in (200, 301, 302, 403):
+                raise NginxError(f"fallback HTTP/1.1 127.0.0.1:{vision['http1_port']} ответил {code or 'ошибкой'}")
+            checks.append(f"fallback HTTP/1.1 → {code}")
+            if vision["h2"]:
+                code, version = probe_fallback(vision["h2_port"], vision["proxy_protocol"], True)
+                if code not in (200, 301, 302, 403) or version != "2":
+                    raise NginxError(f"fallback HTTP/2 127.0.0.1:{vision['h2_port']} ответил {code or 'ошибкой'}")
+                checks.append(f"fallback h2c → {code}")
+            for route in routes:
+                reachable = _tcp_open(str(route.get("upstream_host") or "127.0.0.1"), int(route["upstream_port"]))
+                where = "через fallback" if int(route.get("public_port") or 443) == 443 else f":{route['public_port']}"
+                checks.append(f"{route['transport']} {route.get('service_name') or route.get('path')} ({where}): "
+                              f"upstream {'ok' if reachable else 'не отвечает'}")
+            return checks
+
+        if not (CONF.exists() and state.get("nginx_hash") == digest and system.unit_active("nginx.service")):
+            checks = self._install(text, cfg, verify)
+            state["nginx_hash"] = digest
+            log.info("Nginx vision fallback applied: %s", "; ".join(checks))
+        else:
+            checks = self.last.get("checks") or verify()
+        e2e = self.vision_e2e(cfg)
+        self.last = {"mode": "vision", "checks": checks, "fallback_ok": True, "cert_in_container": in_container,
+                     "e2e": e2e, "at": time.time()}
+        return "vision: " + e2e["summary"]
+
+    def vision_e2e(self, cfg):
+        """State of Xray :443 as an ordinary browser sees it."""
+        owner = ports.port_busy(443, "tcp")
+        if not owner:
+            return {"ok": False, "summary": "fallback готов, ждёт inbound Xray на 443 (синхронизация с Remnawave)"}
+        if owner["role"] != "xray":
+            return {"ok": False, "summary": f"443 занят {owner['process'] or owner['role']}"}
+        vision = vision_settings(cfg)
+        h1 = probe_vision_443(cfg.get("server_name"), False)
+        out = {"http1": h1[0]}
+        if vision["h2"]:
+            h2 = probe_vision_443(cfg.get("server_name"), True)
+            out["h2"] = h2[0]
+            out["h2_version"] = h2[1]
+        good = h1[0] in (200, 301, 302, 403) and (not vision["h2"] or out["h2"] in (200, 301, 302, 403))
+        out["ok"] = good
+        out["summary"] = ("Xray :443 → сайт-заглушка: HTTP/1.1 " + str(h1[0])
+                          + (f", HTTP/2 {out['h2']}" if vision["h2"] else "")) if good else \
+            f"Xray слушает 443, но обычный HTTPS не доходит до сайта (HTTP/1.1 {h1[0]}" + \
+            (f", HTTP/2 {out.get('h2')}" if vision["h2"] else "") + ") — проверьте fallbacks и сертификат inbound"
+        return out
+
+
+def _digest(text, cert_file):
+    import hashlib
+
+    return hashlib.sha256((text + str(cert_file.stat().st_mtime)).encode()).hexdigest()[:16]
 
 
 def container_network(name):

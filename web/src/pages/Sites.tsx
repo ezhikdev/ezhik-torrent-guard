@@ -90,7 +90,7 @@ export function Sites() {
   const sites: any[] = data.sites;
   return (
     <div class="stack">
-      <PageHead title="Сайты-заглушки" sub="Сайт, который видят посетители нод в режиме Nginx Frontend"
+      <PageHead title="Сайты-заглушки" sub="Сайт, который видят посетители нод в режимах Nginx Frontend и Vision + TLS"
         actions={<>
           <Button icon="eye" onClick={() => window.open('/site-mask/', '_blank', 'noopener')}>Предпросмотр сайта</Button>
           <Button variant="primary" icon="plus" onClick={() => setUploading(null)}>Загрузить сайт</Button>
@@ -143,8 +143,8 @@ export function Sites() {
         </div>
       ))}
       <div class="card card--flush">
-        <div class="card-head" style={{ padding: '18px 20px 6px' }}><div class="card-title">Распространение на ноды</div><span class="tiny faint">только ноды в режиме Nginx Frontend</span></div>
-        {data.nodes.length === 0 ? <div class="small faint" style={{ padding: '0 20px 18px' }}>Нет нод с Nginx Frontend.</div> : (
+        <div class="card-head" style={{ padding: '18px 20px 6px' }}><div class="card-title">Распространение на ноды</div><span class="tiny faint">ноды в режимах Frontend и Vision</span></div>
+        {data.nodes.length === 0 ? <div class="small faint" style={{ padding: '0 20px 18px' }}>Нет нод в режимах Frontend или Vision.</div> : (
           <div class="table-wrap">
             <table class="table">
               <thead><tr><th>Нода</th><th>Сайт</th><th>Нужная версия</th><th>Установлена</th><th /></tr></thead>

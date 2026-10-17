@@ -44,6 +44,7 @@ class NodeService:
         self._last_seen_mem = {}
         self.sites = None
         self.remnawave_cache = {}
+        self.vision_ready_hook = None   # set by the app: performs a confirmed Remnawave sync
 
     # --------------------------------------------------------------- wake
 
@@ -150,6 +151,9 @@ class NodeService:
                                     {k: i.get(k) for k in ("tag", "type", "network", "security", "port")}
                                     for i in ((rw.get("configProfile") or {}).get("activeInbounds") or [])]} if rw else None
             out["route_checks"] = nginx_routes.check_routes(out["nginx"], rw, (report.get("ports") or {}).get("container_network"))
+            if out["nginx"]["mode"] == "vision":
+                out["vision_check"] = nginx_routes.check_vision(out["nginx"], rw, self.vision_context(row, report))
+                out["vision_pending"] = self.db.get_json(f"vision_sync:{row['id']}")
             out["diagnostics"] = loads(row["diagnostics"], None)
             out["diagnostics_at"] = row["diagnostics_at"]
             out["facts"] = facts
@@ -286,7 +290,7 @@ class NodeService:
         if not nginx_cfg["server_name"] and node.get("domain"):
             nginx_cfg["server_name"] = node["domain"]
         cfg["nginx"] = nginx_cfg
-        if nginx_cfg["mode"] == "frontend" and self.sites:
+        if nginx_routes.uses_nginx(nginx_cfg) and self.sites:
             site, version = self.sites.effective_for(node)
             if site:
                 sha = self.db.scalar("SELECT sha256 FROM site_versions WHERE site_id=? AND version=?", (site["id"], version))
@@ -300,6 +304,25 @@ class NodeService:
             if node["desired_agent_version"] == version:
                 cfg["agent"] = {"version": version, "sha256": sha, "url": f"/agent/v1/agent-bundle/{version}.tar.gz"}
         return cfg
+
+    def vision_context(self, node, report=None):
+        report = report if report is not None else (loads(node.get("report"), {}) or {})
+        cert = None
+        if node.get("cert_id"):
+            row = self.db.one("SELECT id, name, version, domains FROM certificates WHERE id=?", (node["cert_id"],))
+            if row:
+                cert = {"id": row["id"], "name": row["name"], "version": row["version"],
+                        "domains": loads(row["domains"], [])}
+        nginx_cfg = nginx_routes.node_config(node)
+        return {
+            "cert": cert,
+            "cert_state": report.get("cert") or {},
+            "cert_target": loads(node.get("cert_target"), {}) or {},
+            "server_name": nginx_cfg["server_name"] or node.get("domain") or "",
+            "nginx_state": report.get("nginx") or {},
+            "container_network": (report.get("ports") or {}).get("container_network"),
+            "rw_nodes": (self.remnawave_cache or {}).get("nodes") or [],
+        }
 
     def remnawave_node(self, node):
         """Matching Remnawave node from the background cache (never blocks)."""
@@ -326,7 +349,7 @@ class NodeService:
                 inbound_ports.append((int(inbound["port"]), fw.inbound_protos(raw)))
         nginx = nginx_routes.node_config(node)
         internal = [r["upstream_port"] for r in nginx.get("routes") or []
-                    if nginx.get("mode") == "frontend" and r.get("enabled")
+                    if nginx_routes.uses_nginx(nginx) and r.get("enabled")
                     and nginx_routes.is_local(r.get("upstream_host"))]
         return fw.plan(node, self.settings.firewall(), report,
                        remnawave_url=self.settings.remnawave().get("url"),
@@ -395,6 +418,12 @@ class NodeService:
             )
         for cid in body.get("acks") or []:
             self.db.execute("UPDATE node_commands SET done_at=? WHERE id=? AND node_id=?", (now, cid, node["id"]))
+        pending = self.db.get_json(f"vision_sync:{node['id']}")
+        nginx_state = body.get("nginx") or {}
+        if pending and pending.get("state") == "waiting" and nginx_state.get("mode") == "vision" \
+                and nginx_state.get("fallback_ok") and self.vision_ready_hook:
+            self.db.set_json(f"vision_sync:{node['id']}", dict(pending, state="running"))
+            threading.Thread(target=self.vision_ready_hook, args=(node["id"],), daemon=True).start()
         report = body.get("update_report")
         report_key = f"update_report:{node['id']}"
         if isinstance(report, dict) and self.db.get_json(report_key) == report.get("started_at"):
@@ -429,6 +458,9 @@ class NodeService:
         if node["status"] == "removing":
             commands = [{"id": "uninstall-" + node["id"], "type": "uninstall"}]
             return {"generation": None, "config": None, "commands": commands, "server_time": time.time()}
+        if body.get("push"):
+            # Out-of-band state report (e.g. Nginx became ready): no config, no commands.
+            return {"pushed": True, "server_time": time.time()}
         wait = max(0, min(30, int(body.get("wait") or 0)))
         waiter = self._waiter(node["id"])
         waiter.clear()
@@ -498,9 +530,19 @@ class NodeService:
             fields["cert_target"] = json.dumps(_cert_target(data["cert_target"] or {}))
         if "nginx" in data:
             try:
-                fields["nginx"] = json.dumps(nginx_routes.validate(data["nginx"]))
+                nginx_cfg = nginx_routes.validate(data["nginx"])
             except nginx_routes.RouteError as exc:
                 raise NodeError(str(exc))
+            if nginx_cfg["mode"] == "vision":
+                rw = self.remnawave_node(node)
+                if rw and not nginx_cfg["vision"]["inbound_tag"]:
+                    raise NodeError("Выберите VLESS inbound для режима Vision")
+                conflicts = nginx_routes.vision_conflicts(nginx_cfg, rw)
+                if conflicts:
+                    raise NodeError("Режим Vision небезопасен: " + "; ".join(conflicts))
+            else:
+                self.db.set_json(f"vision_sync:{node_id}", None)
+            fields["nginx"] = json.dumps(nginx_cfg)
         if "firewall" in data:
             try:
                 fields["firewall"] = json.dumps(fw.validate_node(data["firewall"]))

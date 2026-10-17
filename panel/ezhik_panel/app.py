@@ -16,6 +16,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from . import __version__, security
 from .certificates import CertError, analyze, covers, normalize_domains, provider_public
 from .dns_providers import AcmeDnsProvider, CloudflareProvider, DnsError
+from .db import loads
 from .nodes import NodeError
 from . import nginx_routes, panel_domain
 from .certificates import HTTP01, normalize_domain
@@ -634,6 +635,75 @@ def build_admin_app(ctx):
         ctx.refresh_remnawave()
         return {"ok": True, "profile": profile.get("name"), "inbound": tag}
 
+    def vision_plan(node_id):
+        """(node, rw_node, profile, before, after, check) for the node's Vision inbound."""
+        node = ctx.nodes.get(node_id)
+        cfg_nginx = nginx_routes.node_config(node)
+        if cfg_nginx["mode"] != "vision":
+            raise HTTPException(400, "Нода не в режиме Vision + TLS Fallback")
+        rw_node = ctx.nodes.remnawave_node(node)
+        check = nginx_routes.check_vision(cfg_nginx, rw_node, ctx.nodes.vision_context(node))
+        if check["problems"]:
+            raise HTTPException(400, "Синхронизация невозможна: " + "; ".join(check["problems"]))
+        profile_uuid = ((rw_node or {}).get("configProfile") or {}).get("activeConfigProfileUuid")
+        if not profile_uuid:
+            raise HTTPException(400, "У ноды в Remnawave нет профиля конфигурации")
+        profile = ctx.sanctions.client().config_profile(profile_uuid)
+        config = profile.get("config") or {}
+        container_dir = (loads(node.get("cert_target"), {}) or {}).get("container_dir") or "/etc/xray/ssl"
+        tag = cfg_nginx["vision"]["inbound_tag"]
+        try:
+            new = nginx_routes.patch_vision(config, tag, cfg_nginx, container_dir)
+        except nginx_routes.RouteError as exc:
+            raise HTTPException(400, str(exc))
+        before = next(i for i in config.get("inbounds", []) if i.get("tag") == tag)
+        after = next(i for i in new.get("inbounds", []) if i.get("tag") == tag)
+        return node, profile_uuid, profile, new, before, after, check
+
+    def apply_vision(node_id, who):
+        node, profile_uuid, profile, new, before, after, check = vision_plan(node_id)
+        if not check["agent_ready"]:
+            raise HTTPException(409, "Агент ещё не освободил порт 443 и не поднял fallback-порты Nginx")
+        ctx.sanctions.client().update_config_profile(profile_uuid, new)
+        db.audit(who, "remnawave.vision_sync", profile_uuid, {"inbound": after.get("tag"), "node": node_id})
+        db.set_json(f"vision_sync:{node_id}", {"state": "done", "at": time.time(), "by": who})
+        ctx.events.record_system("node", f"Vision: inbound {after.get('tag')} настроен в Remnawave для {node['name']}",
+                                 "info", node_id=node_id)
+        ctx.refresh_remnawave()
+        return {"ok": True, "profile": profile.get("name"), "inbound": after.get("tag")}
+
+    def vision_ready(node_id):
+        """Confirmed sync, started by the first report in which Nginx is ready."""
+        pending = db.get_json(f"vision_sync:{node_id}") or {}
+        try:
+            apply_vision(node_id, pending.get("by") or "admin")
+        except Exception as exc:  # keep the reason for the UI
+            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+            db.set_json(f"vision_sync:{node_id}", dict(pending, state="failed", error=str(detail)[:400], at=time.time()))
+            ctx.events.record_system("node", "Vision: синхронизация с Remnawave не выполнена", "error",
+                                     node_id=node_id, data={"detail": str(detail)[:400]})
+
+    ctx.nodes.vision_ready_hook = vision_ready
+
+    @app.post("/api/nodes/{node_id}/nginx/vision-sync")
+    def vision_sync(node_id: str, body: dict = Body(...), who=Depends(actor)):
+        """Preview (default), apply now (confirm) or apply when the agent is ready (confirm + when_ready)."""
+        if body.get("cancel"):
+            db.set_json(f"vision_sync:{node_id}", None)
+            return {"ok": True}
+        node, profile_uuid, profile, new, before, after, check = vision_plan(node_id)
+        if not body.get("confirm"):
+            return {"preview": True, "profile": profile.get("name"), "inbound": after.get("tag"),
+                    "before": before, "after": after, "drift": check["drift"], "notes": check["notes"],
+                    "agent_ready": check["agent_ready"]}
+        if check["agent_ready"]:
+            return apply_vision(node_id, who)
+        if not body.get("when_ready"):
+            raise HTTPException(409, "Агент ещё не переключил Nginx — подтвердите синхронизацию «когда будет готово»")
+        db.set_json(f"vision_sync:{node_id}", {"state": "waiting", "at": time.time(), "by": who})
+        db.audit(who, "remnawave.vision_sync_scheduled", profile_uuid, {"inbound": after.get("tag"), "node": node_id})
+        return {"ok": True, "scheduled": True}
+
     # ------------------------------------------------------------- sites
 
     @app.get("/api/sites")
@@ -642,7 +712,7 @@ def build_admin_app(ctx):
         default = next((x for x in sites if x["is_default"]), None)
         status = []
         for node in ctx.nodes.list():
-            if node["nginx"]["mode"] != "frontend":
+            if not nginx_routes.uses_nginx(node["nginx"]):
                 continue
             site_row, version = ctx.sites.effective_for({"site_id": node["site_id"]})
             status.append({"id": node["id"], "name": node["name"], "online": node["online"],

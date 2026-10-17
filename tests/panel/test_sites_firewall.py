@@ -159,6 +159,88 @@ class FirewallPlanTests(unittest.TestCase):
         self.assertTrue(any(r["ports"] == "443" and not r["sources"] for r in cfg["rules"]))
 
 
+class VisionTests(unittest.TestCase):
+    def inbound(self, tag="vision-in", port=10445, security="none", protocol="vless", network="raw", listen="127.0.0.1",
+                **settings):
+        raw = {"tag": tag, "protocol": protocol, "listen": listen, "port": port,
+               "settings": {"clients": [], "decryption": "none", **settings},
+               "streamSettings": {"network": network, "security": security}}
+        return {"uuid": f"u-{tag}", "tag": tag, "type": protocol, "port": port, "network": network,
+                "security": security, "rawInbound": raw}
+
+    def rw(self, *inbounds, uuid="n1", profile="p1"):
+        return {"uuid": uuid, "name": uuid, "configProfile": {"activeConfigProfileUuid": profile,
+                                                              "activeInbounds": list(inbounds)}}
+
+    def cfg(self, tag="vision-in", **vision):
+        return nginx_routes.validate({"mode": "vision", "vision": {"inbound_tag": tag, **vision}})
+
+    def ctx(self, **kw):
+        base = {"cert": {"domains": ["node.example.com"]}, "cert_state": {"version": 1}, "server_name": "node.example.com",
+                "cert_target": {"container_dir": "/etc/xray/ssl"}, "container_network": "host",
+                "nginx_state": {"mode": "vision", "fallback_ok": True}, "rw_nodes": []}
+        base.update(kw)
+        return base
+
+    def test_reality_and_port_443_conflicts(self):
+        reality = self.inbound("reality-in", port=443, security="reality", listen="0.0.0.0")
+        self.assertTrue(nginx_routes.vision_conflicts(self.cfg(), self.rw(self.inbound(), reality)))
+        local = self.inbound("local-443", port=443, listen="127.0.0.1")
+        self.assertEqual(nginx_routes.vision_conflicts(self.cfg(), self.rw(self.inbound(), local)), [])
+        self.assertTrue(nginx_routes.vision_conflicts(self.cfg("reality-in"), self.rw(reality)))
+        grpc = self.inbound("grpc-in", network="grpc")
+        self.assertTrue(nginx_routes.vision_conflicts(self.cfg("grpc-in"), self.rw(grpc)))
+        self.assertEqual(nginx_routes.vision_conflicts(self.cfg(), self.rw(self.inbound(), grpc)), [])
+
+    def test_check_drift_and_shared_profile(self):
+        node = self.rw(self.inbound())
+        result = nginx_routes.check_vision(self.cfg(), node, self.ctx(rw_nodes=[node]))
+        self.assertFalse(result["problems"])
+        self.assertTrue(result["can_sync"])
+        self.assertTrue(any("443" in d for d in result["drift"]))
+        other = self.rw(self.inbound(), uuid="n2")
+        shared = nginx_routes.check_vision(self.cfg(), node, self.ctx(rw_nodes=[node, other]))
+        self.assertFalse(shared["can_sync"])
+        self.assertEqual(shared["shared_with"], ["n2"])
+        nocert = nginx_routes.check_vision(self.cfg(), node, self.ctx(cert=None))
+        self.assertTrue(any("сертификат" in p for p in nocert["problems"]))
+        waiting = nginx_routes.check_vision(self.cfg(), node, self.ctx(nginx_state={"mode": "frontend"}))
+        self.assertFalse(waiting["can_sync"])
+
+    def test_patch_only_touches_one_inbound(self):
+        reality = self.inbound("reality-in", port=9443, security="reality")["rawInbound"]
+        target = self.inbound(flow="")["rawInbound"]
+        target["sniffing"] = {"enabled": True}
+        config = {"inbounds": [target, reality], "outbounds": [{"tag": "DIRECT"}]}
+        new = nginx_routes.patch_vision(config, "vision-in", self.cfg(), "/etc/xray/ssl")
+        vision = new["inbounds"][0]
+        self.assertEqual((vision["listen"], vision["port"]), ("0.0.0.0", 443))
+        self.assertEqual(vision["settings"]["flow"], "xtls-rprx-vision")
+        self.assertEqual(vision["streamSettings"]["security"], "tls")
+        self.assertEqual(vision["streamSettings"]["tlsSettings"]["certificates"][0]["certificateFile"],
+                         "/etc/xray/ssl/fullchain.pem")
+        self.assertEqual(vision["streamSettings"]["tlsSettings"]["alpn"], ["h2", "http/1.1"])
+        self.assertEqual([f["dest"] for f in vision["settings"]["fallbacks"]], ["127.0.0.1:8001", "127.0.0.1:8002"])
+        self.assertEqual(vision["sniffing"], {"enabled": True})
+        self.assertEqual(new["inbounds"][1], reality)
+        self.assertEqual(config["inbounds"][0]["port"], 10445)  # original untouched
+        after = self.rw({**self.inbound(), "port": 443, "rawInbound": vision})
+        self.assertEqual(nginx_routes.check_vision(self.cfg(), after, self.ctx())["drift"], [])
+        with self.assertRaises(nginx_routes.RouteError):
+            nginx_routes.patch_vision(config, "reality-in", self.cfg("reality-in"), "/etc/xray/ssl")
+
+    def test_ports_and_validation(self):
+        cfg = nginx_routes.validate({"mode": "vision", "routes": [
+            {"transport": "grpc", "public_port": 443, "service_name": "s", "upstream_port": 10443},
+            {"transport": "ws", "public_port": 8443, "path": "/ws", "upstream_port": 10444}]})
+        self.assertEqual(nginx_routes.public_ports(cfg), [80, 8443])
+        with self.assertRaises(nginx_routes.RouteError):
+            nginx_routes.validate({"mode": "vision", "vision": {"h2": False}, "routes": [
+                {"transport": "grpc", "public_port": 443, "service_name": "s", "upstream_port": 10443}]})
+        with self.assertRaises(nginx_routes.RouteError):
+            nginx_routes.validate({"mode": "vision", "vision": {"http1_port": 8002, "h2_port": 8002}})
+
+
 class RouteCheckTests(unittest.TestCase):
     def rw_node(self, **raw):
         inbound = {"tag": "grpc-in", "port": 10443, "network": "grpc", "security": "none",

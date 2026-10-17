@@ -91,6 +91,27 @@ class NginxRenderTests(unittest.TestCase):
     def test_no_redirect(self):
         self.assertNotIn("return 301", self.render([self.route], http_redirect=False))
 
+    def test_vision_fallback_server(self):
+        cfg = {"mode": "vision", "routes": [self.route, {"transport": "ws", "path": "/ws", "upstream_port": 10444,
+                                                         "public_port": 8443}],
+               "vision": {"http1_port": 8001, "h2_port": 8002, "h2": True, "proxy_protocol": True}}
+        text = nginx.render_vision(cfg, Path("/c.pem"), Path("/k.pem"))
+        self.assertNotIn("listen 443", text)  # Xray owns 443
+        self.assertIn("listen 127.0.0.1:8001 proxy_protocol default_server;", text)
+        self.assertIn("listen 127.0.0.1:8002 http2 proxy_protocol default_server;", text)
+        self.assertIn("real_ip_header proxy_protocol;", text)
+        fallback = text.split("# Fallback target")[1].split("listen 8443")[0]
+        self.assertIn("grpc_pass grpc://127.0.0.1:10443;", fallback)  # 443 routes go through the fallback
+        self.assertIn("listen 8443 ssl http2 default_server;", text)  # other ports keep TLS in Nginx
+        self.assertIn("return 301 https://$host$request_uri;", text)
+
+    def test_vision_http1_only_without_proxy_protocol(self):
+        cfg = {"mode": "vision", "routes": [], "vision": {"h2": False, "proxy_protocol": False}}
+        text = nginx.render_vision(cfg, Path("/c.pem"), Path("/k.pem"))
+        self.assertIn("listen 127.0.0.1:8001 default_server;", text)
+        self.assertNotIn("8002", text)
+        self.assertNotIn("proxy_protocol", text)
+
 
 if __name__ == "__main__":
     unittest.main()
