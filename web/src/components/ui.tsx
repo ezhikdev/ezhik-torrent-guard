@@ -1,4 +1,5 @@
 import type { ComponentChildren, JSX } from 'preact';
+import { createPortal } from 'preact/compat';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { navigate, toast, toastError } from '../state';
 import { Icon } from './Icon';
@@ -289,7 +290,9 @@ export function Modal({ title, desc, onClose, children, wide }: { title: Compone
       document.body.style.overflow = '';
     };
   }, [onClose]);
-  return (
+  // Portal to <body>: a modal opened from inside an animated/transformed card
+  // would otherwise be positioned and layered within that card.
+  return createPortal(
     <div class="modal-root" role="dialog" aria-modal="true">
       <div class="modal-scrim" onClick={onClose} />
       <div class={`modal ${wide ? 'modal--wide' : ''}`}>
@@ -302,7 +305,8 @@ export function Modal({ title, desc, onClose, children, wide }: { title: Compone
         </div>
         {children}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
