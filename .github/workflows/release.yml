@@ -1,0 +1,83 @@
+name: Test and release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python: ["3.10", "3.12"]   # system Python of Ubuntu 22.04 / 24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install panel dependencies
+        run: pip install -r panel/requirements.txt
+      - name: Static checks
+        run: |
+          python -m compileall -q agent panel scripts tests
+          bash -n install.sh uninstall.sh packaging/*.sh tests/integration/*.sh
+      - name: Agent tests (stdlib only)
+        run: python -m unittest discover -s tests/agent -t tests/agent -v
+      - name: Panel tests
+        run: python -m unittest discover -s tests/panel -t tests/panel -v
+
+  web:
+    name: Web UI
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --no-audit --no-fund
+        working-directory: web
+      - run: npm run build
+        working-directory: web
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          retention-days: 7
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, web]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+      - name: Verify tag matches VERSION
+        run: test "${GITHUB_REF_NAME}" = "v$(tr -d '[:space:]' < VERSION)"
+      - name: Build release archive
+        run: python3 scripts/build_release.py --skip-web
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The asset name never changes, so the universal installer can always
+          # fetch releases/latest/download/ezhik-guard.tar.gz.
+          # A release created in the GitHub web UI already exists: attach assets to it.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/ezhik-guard.tar.gz dist/ezhik-guard.tar.gz.sha256 --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/ezhik-guard.tar.gz dist/ezhik-guard.tar.gz.sha256 \
+              --verify-tag --generate-notes --title "Ezhik Guard $GITHUB_REF_NAME"
+          fi

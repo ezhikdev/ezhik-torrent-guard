@@ -1,0 +1,202 @@
+# Builds the Suricata + strict nDPI runtime assets. Run manually only when
+# RUNTIME.env changes (new engine revision); publish under a tag such as
+# runtime-r4 and update RUNTIME_RELEASE_TAG / RUNTIME_SHA256_* in RUNTIME.env.
+name: Build Suricata runtime
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag for the runtime assets (e.g. runtime-r4)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  quality:
+    name: Source checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check Python, shell, and detector tests
+        shell: bash
+        run: |
+          python3 -m py_compile scripts/*.py
+          bash -n scripts/*.sh
+
+  build:
+    name: Ubuntu ${{ matrix.os_version }} amd64
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            os_version: "22.04"
+          - runner: ubuntu-24.04
+            os_version: "24.04"
+
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Verify version and tag
+        shell: bash
+        run: |
+          test "$(. /etc/os-release; printf '%s' "$VERSION_ID")" = "${{ matrix.os_version }}"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            ca-certificates curl git autoconf automake build-essential \
+            cargo cbindgen gettext flex bison libjansson-dev libjson-c-dev \
+            libpcap-dev libpcre2-dev libtool libyaml-dev pkg-config rustc \
+            zlib1g-dev libnetfilter-queue-dev libnfnetlink-dev libcap-ng-dev \
+            libmagic-dev libnet1-dev libnuma-dev libmaxminddb-dev librrd-dev \
+            libgcrypt20-dev libgpg-error-dev libcurl4-openssl-dev python3 zstd
+
+      - name: Build packaged runtime
+        env:
+          BUILD_JOBS: "2"
+        run: |
+          chmod +x scripts/build-runtime.sh
+          scripts/build-runtime.sh --output-dir dist --jobs "$BUILD_JOBS"
+
+      - name: Upload test artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: runtime-ubuntu-${{ matrix.os_version }}-amd64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  verify:
+    name: Verify Ubuntu ${{ matrix.os_version }} package
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            os_version: "22.04"
+          - runner: ubuntu-24.04
+            os_version: "24.04"
+
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: runtime-ubuntu-${{ matrix.os_version }}-amd64
+          path: dist
+
+      - name: Verify archive and runtime dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-yaml zstd
+          (cd dist && sha256sum -c *.sha256)
+          mkdir runtime
+          tar --zstd -xf dist/*.tar.zst -C runtime
+          mapfile -t packages < <(
+            python3 - <<'PY'
+          import json
+          for package in json.load(open("runtime/runtime-manifest.json"))["runtime_packages"]:
+              print(package)
+          PY
+          )
+          test "${#packages[@]}" -gt 0
+          missing=()
+          for package in "${packages[@]}"; do
+            status="$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)"
+            [[ "$status" == "install ok installed" ]] || missing+=("$package")
+          done
+          if (( ${#missing[@]} > 0 )); then
+            sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
+          fi
+          engine_id="$(
+            . RUNTIME.env
+            printf 'suricata-%s-ndpi-%s-r%s' \
+              "$SURICATA_VERSION" "$NDPI_VERSION" "$RUNTIME_REVISION"
+          )"
+          version="$(tr -d '[:space:]' < VERSION)"
+          runtime_prefix="/opt/ezhik-suricata-$(. RUNTIME.env; printf '%s' "$SURICATA_VERSION")"
+          cpu_baseline="$(. RUNTIME.env; printf '%s' "$CPU_BASELINE")"
+          python3 scripts/verify-runtime.py runtime \
+            --app-version "$version" \
+            --engine-id "$engine_id" \
+            --os-version "${{ matrix.os_version }}" \
+            --arch amd64 \
+            --cpu-baseline "$cpu_baseline" \
+            --runtime-prefix "$runtime_prefix"
+          prefix="runtime${runtime_prefix}"
+          ! ldd "$prefix/bin/suricata" | grep -q 'not found'
+          ! ldd "$prefix/lib/ezhik/ndpi.so" | grep -q 'not found'
+          "$prefix/bin/suricata" --build-info
+          config="$prefix/etc/suricata/suricata.yaml"
+          classification="$prefix/etc/suricata/classification.config"
+          reference="$prefix/etc/suricata/reference.config"
+          threshold="$prefix/etc/suricata/threshold.config"
+          python3 scripts/render_suricata_config.py \
+            "$config" eth0 192.0.2.1 "$prefix/lib/ezhik/ndpi.so"
+          test_args=(
+            -T -c "$config"
+            -S suricata/ezhik-torrent-only.rules
+            --set "classification-file=$classification"
+            --set "reference-config-file=$reference"
+          )
+          if [[ -f "$threshold" ]]; then
+            test_args+=(--set "threshold-file=$threshold")
+          fi
+          "$prefix/bin/suricata" "${test_args[@]}"
+
+  release:
+    name: Publish GitHub release
+    needs: [quality, verify]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: runtime-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create release manifest
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          python3 scripts/create-release-manifest.py \
+            --dist dist \
+            --version "$version" \
+            --output dist/release-manifest.json
+          (cd dist && sha256sum release-manifest.json > release-manifest.json.sha256)
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ inputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --target "$GITHUB_SHA" --prerelease \
+              --title "Suricata runtime $TAG" \
+              --notes "Prebuilt Suricata + strict nDPI runtime for Ezhik Guard nodes. Update RUNTIME.env to use it."
+          fi
