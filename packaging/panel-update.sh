@@ -19,7 +19,13 @@ status() {
 
 status running "Загрузка и установка новой версии"
 rm -f "$REQUEST"
-if bash "$BASE/current/install.sh" --update >"$LOG" 2>&1; then
+# Prefer the current installer from GitHub (fixes in it apply even when the
+# installed release has an older copy); fall back to the bundled one.
+INSTALLER="$(mktemp /tmp/ezhik-guard-install.XXXXXX)"
+if ! curl -fsSL --retry 3 https://raw.githubusercontent.com/ezhikdev/ezhik-torrent-guard/main/install.sh -o "$INSTALLER"; then
+  cp "$BASE/current/install.sh" "$INSTALLER"
+fi
+if bash "$INSTALLER" --update >"$LOG" 2>&1; then
   status done "Обновлено до $(cat "$BASE/current/VERSION")"
 else
   status failed "$(tail -n 3 "$LOG" | tr '\n' ' ' | cut -c1-300)"

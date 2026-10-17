@@ -18,7 +18,7 @@ ENV_FILE="$CONFIG_DIR/panel.env"
 SERVICE_USER=ezhik-guard
 LOG=/var/log/ezhik-guard-install.log
 
-VERSION=""
+REQUESTED_VERSION=""
 BUNDLE=""
 ASSUME_YES=0
 MODE="install"
@@ -51,7 +51,7 @@ USAGE
 PURGE=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --version) VERSION="${2#v}"; shift 2 ;;
+    --version) REQUESTED_VERSION="${2#v}"; shift 2 ;;
     --bundle) BUNDLE="$2"; shift 2 ;;
     --yes|-y) ASSUME_YES=1; shift ;;
     --web-port) WEB_PORT="$2"; shift 2 ;;
@@ -129,13 +129,16 @@ cat <<'BANNER'
 BANNER
 
 [ -r /etc/os-release ] || die "Не удалось определить ОС."
-. /etc/os-release
-case "${ID:-}" in
+# Read os-release in a subshell: it defines VERSION, ID etc. that must not
+# leak into the installer's own variables.
+OS_ID="$(. /etc/os-release && printf '%s' "${ID:-}")"
+OS_PRETTY="$(. /etc/os-release && printf '%s' "${PRETTY_NAME:-unknown}")"
+case "$OS_ID" in
   ubuntu) ;;
   debian) c_warn "Debian не входит в список протестированных ОС панели." ;;
-  *) die "Поддерживается Ubuntu 22.04/24.04 (обнаружено ${PRETTY_NAME:-unknown})." ;;
+  *) die "Поддерживается Ubuntu 22.04/24.04 (обнаружено $OS_PRETTY)." ;;
 esac
-c_ok "ОС: ${PRETTY_NAME}"
+c_ok "ОС: $OS_PRETTY"
 
 # ----------------------------------------------------------- dependencies
 
@@ -173,8 +176,8 @@ if [ -n "$BUNDLE" ]; then
       || die "Контрольная сумма $BUNDLE не совпадает."
   fi
 else
-  if [ -n "$VERSION" ]; then
-    URL="https://github.com/$REPO/releases/download/v$VERSION/$ASSET"
+  if [ -n "$REQUESTED_VERSION" ]; then
+    URL="https://github.com/$REPO/releases/download/v$REQUESTED_VERSION/$ASSET"
   else
     URL="https://github.com/$REPO/releases/latest/download/$ASSET"
   fi
