@@ -1,0 +1,6 @@
+#!/bin/sh
+[ -n "$EZHIK_FAKE_LOG" ] && echo "systemd-run $*" >> "$EZHIK_FAKE_LOG"
+# drop systemd-run options, execute the command detached
+while [ $# -gt 0 ]; do case "$1" in --unit|--property) shift 2;; --*) shift;; *) break;; esac; done
+setsid "$@" >/dev/null 2>&1 < /dev/null &
+exit 0

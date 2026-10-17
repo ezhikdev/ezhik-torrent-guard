@@ -1,0 +1,4 @@
+#!/bin/sh
+[ -n "$EZHIK_FAKE_LOG" ] && echo "iptables $*" >> "$EZHIK_FAKE_LOG"
+case "$*" in *"-D OUTPUT"*ezhik*) touch "$EZHIK_FAKE_STATE.fw-cleaned";; esac
+exit 0

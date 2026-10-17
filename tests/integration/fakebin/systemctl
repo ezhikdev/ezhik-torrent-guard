@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""systemctl stand-in: remembers unit states in $EZHIK_FAKE_STATE."""
+import json
+import os
+import sys
+from pathlib import Path
+
+STATE = Path(os.environ.get("EZHIK_FAKE_STATE", "/tmp/fake-systemd.json"))
+LOG = os.environ.get("EZHIK_FAKE_LOG")
+KNOWN = {"ezhik-torrent-guard.service", "ezhik-suricata.service", "ezhik-ram-log-guard.service"}
+
+
+PIDFILE = Path(os.environ.get("EZHIK_FAKE_AGENT_PID", "/run/fake-ezhik-agent.pid"))
+
+
+def launch_agent(restart):
+    """Run the agent like the real unit would (Restart=always loop)."""
+    import signal
+    import subprocess
+
+    if PIDFILE.exists():
+        if not restart:
+            return
+        try:
+            os.killpg(int(PIDFILE.read_text()), signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
+    loop = ("while true; do PYTHONPATH=/opt/ezhik-guard/agent/current python3 -m ezhik_agent run; "
+            "c=$?; [ $c -eq 0 ] && exit 0; sleep 2; done")
+    proc = subprocess.Popen(["setsid", "bash", "-c", loop], stdin=subprocess.DEVNULL,
+                            stdout=open("/var/log/ezhik-agent-fake.log", "a"), stderr=subprocess.STDOUT)
+    PIDFILE.write_text(str(proc.pid))
+
+
+def load():
+    try:
+        return json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def main(argv):
+    if LOG:
+        with open(LOG, "a") as handle:
+            handle.write("systemctl " + " ".join(argv) + "\n")
+    state = load()
+    args = [a for a in argv if not a.startswith("--")]
+    if not args:
+        return 0
+    cmd, units = args[0], args[1:]
+    if cmd in ("daemon-reload", "reset-failed"):
+        return 0
+    if cmd in ("start", "restart", "reload"):
+        for unit in units:
+            state[unit] = "active"
+            if unit == "ezhik-guard-agent.service" and os.environ.get("EZHIK_FAKE_START_AGENT"):
+                launch_agent(cmd == "restart")
+    elif cmd in ("stop",):
+        for unit in units:
+            state[unit] = "inactive"
+    elif cmd == "disable" and "--now" in argv:
+        for unit in units:
+            state[unit] = "inactive"
+    elif cmd == "is-active":
+        unit = units[0]
+        STATE.write_text(json.dumps(state))
+        active = state.get(unit) == "active"
+        if "--quiet" not in argv:
+            print("active" if active else "inactive")
+        return 0 if active else 3
+    elif cmd == "show":
+        unit = units[0]
+        exists = unit.startswith("ezhik") or unit in KNOWN
+        load_state = "loaded" if exists else "not-found"
+        if "--value" in argv:
+            print(load_state)
+        else:
+            print(f"ActiveState={state.get(unit, 'inactive')}\nSubState=running\nLoadState={load_state}\nNRestarts=0")
+    STATE.write_text(json.dumps(state))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

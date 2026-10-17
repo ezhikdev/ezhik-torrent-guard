@@ -1,0 +1,18 @@
+#!/bin/sh
+# Pretend a 1.x leftover rule exists next to unrelated rules that must survive.
+if [ -f "$EZHIK_FAKE_STATE.fw-cleaned" ]; then
+cat <<R
+*filter
+:INPUT ACCEPT [0:0]
+-A INPUT -p tcp --dport 22 -j ACCEPT
+COMMIT
+R
+else
+cat <<R
+*filter
+:INPUT ACCEPT [0:0]
+-A INPUT -p tcp --dport 22 -j ACCEPT
+-A OUTPUT -m comment --comment "ezhik-torrent-guard nfqueue" -j NFQUEUE --queue-num 7
+COMMIT
+R
+fi

@@ -1,0 +1,6 @@
+#!/bin/sh
+[ -n "$EZHIK_FAKE_LOG" ] && echo "nft $*" >> "$EZHIK_FAKE_LOG"
+if [ "$1" = "-j" ]; then
+  echo '{"nftables":[{"metainfo":{}},{"table":{"family":"inet","name":"filter"}},{"table":{"family":"inet","name":"ezhik_guard_legacy"}}]}'
+fi
+exit 0
