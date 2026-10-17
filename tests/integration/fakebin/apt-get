@@ -1,0 +1,4 @@
+#!/bin/sh
+# apt-get stand-in: packages are provided by the sandbox (libs/), succeed.
+[ -n "$EZHIK_FAKE_LOG" ] && echo "apt-get $*" >> "$EZHIK_FAKE_LOG"
+exit 0

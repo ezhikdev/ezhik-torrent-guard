@@ -1,111 +1,119 @@
-# 🦔 Ezhik Torrent Guard
+# 🦔 Ezhik Guard
 
-Автоматическая защита Xray / Remnawave exit-нод от BitTorrent abuse и
-исходящего сканирования портов.
+Централизованная защита VPN-нод Xray / Remnawave от торрентов, P2P-рассылок и
+сканирования портов — и единое управление SSL-сертификатами нод. Одна панель с
+веб-интерфейсом, лёгкий агент на каждой ноде.
 
 ```text
 Developer : ezhikdev
 Telegram  : @ezhikdev
 GitHub    : https://github.com/ezhikdev
-Version   : 1.2.4
+Version   : 2.0
 ```
 
-Guard связывает сетевое нарушение с точным числовым ID авторизованного клиента
-Xray и применяет санкцию только к его подписке через Remnawave API. Общий
-ingress-IP пользователя для блокировки не используется.
+Ezhik Guard объединяет **Ezhik Torrent Guard 1.x** и **Ezhik SSL Manager**. Нарушение
+привязывается к точному числовому ID клиента Xray, и блокируется только его
+подписка через Remnawave API — общий IP пользователей не страдает.
 
 ## Возможности
 
-- обнаружение BitTorrent через Suricata 8.0.6 и strict nDPI 4.14;
-- точная корреляция `Xray request → client ID → outbound socket → nDPI alert`;
-- обнаружение TCP/UDP-сканирования публичных IPv4-адресов;
-- учёт обращений к закрытым портам по access-событиям Xray;
-- независимые режимы наблюдения и блокировки для Torrent Guard и Port Guard;
-- временное отключение клиента с автоматическим восстановлением;
-- бессрочное отключение с последующей ручной разблокировкой в Remnawave Panel;
-- список клиентов, которых Guard никогда не отключает;
-- русскоязычные Telegram-уведомления и текстовые отчёты об инцидентах;
-- обработка сетевой метаинформации в RAM без записи PCAP и payload на диск;
-- готовые runtime-пакеты для Ubuntu 22.04 и 24.04 без компиляции на сервере.
+**Панель**
+- установка одной неизменной командой, обновление — кнопкой в интерфейсе;
+- добавление ноды: панель выдаёт одноразовую команду, нода подключается сама;
+- обновление агентов одной кнопкой (по одной ноде или всех сразу), проверка
+  SHA-256 и автоматический откат, если новая версия не запустилась;
+- обзор: ноды на связи, обнаружения по времени, блокировки, частые нарушители,
+  истекающие сертификаты;
+- ноды: состояние, uptime и доступность по часам, CPU/RAM/диск/сеть, версия
+  агента, компоненты защиты, диагностика с подсказками, события ноды;
+- массовые действия и фильтры для большого числа нод;
+- журнал событий, реестр блокировок (снять сейчас, продлить, удерживать,
+  защищённые клиенты), карточка клиента с данными из Remnawave;
+- уведомления в Telegram с текстовыми отчётами для ответа хостеру;
+- журнал аудита, сессии администратора, светлая и тёмная темы, мобильная версия.
 
-> Текущая версия детекторов работает с IPv4. Подробнее об ограничениях — в
-> разделе [Ограничения](#ограничения).
+**Защита (общие настройки для всех нод, включение на каждой ноде отдельно)**
+- BitTorrent: Suricata 8.0.6 + strict nDPI 4.14 и точная атрибуция
+  `Xray request → client ID → outbound socket → nDPI alert`;
+- P2P / DHT fan-out: клиент обращается к сотням несвязанных хостов на случайных
+  портах (шифрованный торрент, DHT, uTP) — именно это хостеры присылают как
+  «portscan»;
+- сканирование портов: перебор портов одного IP и плотный скан подсети /24;
+- режимы «наблюдение» и «блокировка», длительность заморозки, пороги;
+- один реестр блокировок для всех нод: один нарушитель — одна санкция,
+  автоматическая разблокировка по истечении срока.
 
-## Как работает защита
+**Сертификаты**
+- собственный ACME-клиент (Let's Encrypt, DNS-01), без certbot;
+- wildcard любой глубины: `*.domain.com`, `*.test.domain.com`,
+  `*.sub.test.domain.com`, вместе с `domain.com` в одном сертификате (SAN);
+- подсказки о покрытии: `*.domain.com` не покрывает `domain.com` и `a.b.domain.com`;
+- DNS-провайдеры: Cloudflare (API-токен), acme-dns (любой DNS-хостинг через один
+  CNAME), ручная публикация TXT-записей;
+- автопродление и автоматическая доставка новой версии на назначенные ноды;
+- назначение сертификата ноде, смена, отключение с удалением файлов;
+- загрузка собственного сертификата; сертификат можно назначить и самой панели.
 
-### BitTorrent
+## Совместимость
 
-```text
-Xray / RemnaNode
-       │ authenticated request
-       ├───────────────┐
-       │               │
-       │        outbound socket
-       │               │
-       └──── exact attribution ──── Suricata + strict nDPI
-                                      │
-                               BitTorrent alert
-                                      │
-                               Remnawave API
+| Компонент | Поддержка |
+|---|---|
+| Ubuntu | 22.04 LTS, 24.04 LTS (amd64) |
+| Remnawave Panel | 3.x (проверено с 3.4.4) и 2.x — версия API определяется автоматически |
+| RemnaNode | старые и новые версии: ID клиента в логах Xray (`email`) не менялся |
+| Xray-core | форматы логов проверены по исходникам v26.7.28 (RemnaNode 3.x) |
+
+**Remnawave 3.x.** В ветке 3 у пользователей больше нет `uuid`, удалён
+`GET /api/users/by-id/{id}`, все маршруты (`/api/users/{id}`,
+`/actions/disable`, `/actions/enable`) принимают числовой ID. Torrent Guard 1.x
+на панели 3.x не мог разблокировать и блокировать пользователей. Ezhik Guard
+определяет версию через `/api/system/metadata` (или пробой маршрутов, если у
+токена нет этого права), работает с обеими ветками и сам переключается после
+обновления Remnawave. Блокировки, выданные на 2.x, корректно снимаются после
+перехода на 3.x.
+
+## Установка панели
+
+На сервере для панели (это может быть и одна из нод) от root:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/ezhikdev/ezhik-torrent-guard/main/install.sh)
 ```
 
-Санкция создаётся только после однозначного сопоставления strict-nDPI alert с
-реальным outbound-сокетом Xray и ID клиента.
+Команда **не меняется между версиями**: она всегда ставит последний релиз.
+Установщик спросит адрес панели для нод и порты (по умолчанию веб-интерфейс
+`8443`, API агентов `8444`) и в конце покажет адрес, логин `admin` и пароль.
 
-### Сканирование портов
+Полезные варианты:
 
-Port Guard анализирует уже существующие access-события Xray. Для каждого
-клиента в RAM поддерживаются отдельные скользящие окна. Попытка учитывается
-сразу после принятия запроса Xray, поэтому удалённый порт не обязан быть открыт.
+```bash
+# сразу защитить и этот сервер (поставить агент локально)
+bash <(curl -fsSL .../install.sh) --with-node
+# конкретная версия / неинтерактивно
+bash <(curl -fsSL .../install.sh) --version 2.0.0 --yes
+# сбросить пароль администратора
+bash <(curl -fsSL .../install.sh) --reset-password
+```
 
-Триггеры по умолчанию считаются отдельно для каждого протокола:
+Порты `8443` (для вас) и `8444` (для нод) должны быть доступны. Веб-интерфейс
+сначала использует сертификат собственного CA панели — браузер покажет
+предупреждение. Выпустите сертификат во вкладке «Сертификаты» и назначьте его
+панели в «Настройки → Панель» (применяется без перезапуска).
 
-- `50` разных TCP-портов одного IP за `60` секунд;
-- `100` разных UDP-портов одного IP за `60` секунд;
-- `16` адресов одной `/24`, `50` разных портов и `100` уникальных назначений
-  одного протокола внутри этой подсети за `60` секунд.
+После входа:
+1. **Настройки → Remnawave**: адрес панели и API-токен, кнопка «Проверить».
+2. **Настройки → Защита**: режимы и длительности (по умолчанию торренты —
+   блокировка, P2P и сканирование — наблюдение).
+3. **Ноды → Добавить ноду**.
 
-Повтор одного назначения не увеличивает счётчик. Обычное большое количество
-HTTPS/QUIC-соединений только к порту `443` не достигает порога разнообразия
-портов. После события действует cooldown `300` секунд для подавления повторных
-уведомлений по тому же клиенту.
+## Подключение ноды
 
-Случайный fan-out по множеству несвязанных IP не считается сканированием сам по
-себе: такой профиль характерен для BitTorrent peer/DHT traffic и без анализа
-протокола неоднозначен. Его классифицирует отдельный strict nDPI Torrent Guard.
-В incident report включаются только назначения, сформировавшие конкретное
-срабатывание; обычные соединения клиента из того же окна туда не подмешиваются.
+1. **Ноды → Добавить ноду**, введите название.
+2. Скопируйте показанную команду и выполните её на ноде от root.
+3. Окно само покажет, что нода подключилась.
 
-Режимы Port Guard:
-
-| Режим | Обнаружение | Отчёт и Telegram | Блокировка клиента |
-|---|---:|---:|---:|
-| `OBSERVE` | Да | Да | Нет |
-| `LIVE` | Да | Да | Да |
-| `DISABLED` | Нет | Нет | Нет |
-
-При бессрочной санкции Guard подтверждает `DISABLED` через Remnawave API и
-забывает локальную санкцию. Администратор может затем вручную включить клиента
-в Remnawave Panel без доступа к ноде.
-
-Подробное техническое описание:
-[`docs/HOSTER_PORT_SCAN_PROTECTION_RU.md`](docs/HOSTER_PORT_SCAN_PROTECTION_RU.md).
-
-## Требования
-
-- Ubuntu 22.04 или 24.04;
-- x86_64 / amd64;
-- установленный и работающий Docker;
-- RemnaNode container, обычно `remnanode`;
-- Remnawave Panel API key;
-- Xray access/info logs в RAM.
-
-Для неподдерживаемой версии Ubuntu или при отсутствии release-runtime installer
-может перейти к сборке Suricata и nDPI из исходников.
-
-## Настройка Xray
-
-В профиле Xray, используемом RemnaNode, должны быть включены оба журнала:
+Требования к ноде: Ubuntu 22.04/24.04 amd64, Docker с контейнером RemnaNode,
+логи Xray в RAM:
 
 ```json
 "log": {
@@ -115,234 +123,127 @@ HTTPS/QUIC-соединений только к порту `443` не дости
 }
 ```
 
-Без `access` и `info` Guard не сможет надёжно связать сетевое событие с
-пользователем. Подробности: [`docs/XRAY_LOGGING.md`](docs/XRAY_LOGGING.md).
+Задайте этот блок в Config Profile Remnawave. Без него точная атрибуция
+невозможна — диагностика ноды подскажет. Подробнее:
+[docs/XRAY_LOGGING.md](docs/XRAY_LOGGING.md).
 
-## Установка и обновление
+**Старый Torrent Guard 1.x и агент SSL Manager удаляются автоматически**:
+останавливаются и удаляются их сервисы, файлы, runtime и помеченные `ezhik`
+правила firewall; конфигурация архивируется в `/var/backups/ezhik-guard/agent`;
+активные блокировки 1.x и список защищённых клиентов передаются в панель.
+Посторонние сервисы, пакеты и правила не затрагиваются. Сертификаты в
+`/etc/xray/ssl` остаются на месте.
 
-Запускать от `root`:
+Агент работает и при недоступной панели: защита продолжает обнаруживать
+нарушения, события копятся на диске и доставляются после восстановления связи.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/ezhikdev/ezhik-torrent-guard/main/install.sh | bash
-```
+## Обновление
 
-Installer запросит:
+- **Панель**: «Настройки → Обновления → Обновить панель» или повтор команды
+  установки. База и настройки сохраняются; если новая версия не стартует,
+  установщик вернёт предыдущую.
+- **Агенты**: после обновления панели на странице «Ноды» появится «Обновить все»
+  (или кнопка на странице ноды). Нода скачивает агент с панели, проверяет SHA-256
+  и перезапускается; при сбое запуска она сама откатывается и сообщает об этом.
 
-1. адрес Remnawave Panel и API key;
-2. защищённые numeric client IDs;
-3. длительность Torrent freeze;
-4. режим Torrent Guard `DRY RUN` или `LIVE`;
-5. включение Port Guard;
-6. длительность port-scan блокировки (`0` — бессрочно);
-7. режим Port Guard `OBSERVE` или `LIVE`;
-8. необязательные Telegram bot token и numeric chat ID администратора.
-
-Повторный запуск той же команды обновляет установленную версию и сохраняет
-текущие настройки. Если версия уже актуальна, installer может выполнить repair
-или reconfiguration.
-
-## Проверка работы
-
-Статус компонентов:
-
-```bash
-systemctl status ezhik-suricata --no-pager
-systemctl status ezhik-torrent-guard --no-pager
-systemctl status ezhik-ram-log-guard --no-pager
-```
-
-Журнал Guard в реальном времени:
-
-```bash
-journalctl -fu ezhik-torrent-guard
-```
-
-Последние события обнаружения и действий:
-
-```bash
-journalctl -u ezhik-torrent-guard --since "1 hour ago" --no-pager | \
-  grep -E "BT EXACT|SCAN DETECTED|WOULD_|ACTION QUEUED|FROZEN|BLOCKED|UNFROZEN|TELEGRAM"
-```
-
-Текущая конфигурация Port Guard:
-
-```bash
-grep -E '^EZHIK_SCAN_(ENABLED|DRY_RUN|BLOCK_SECONDS|WINDOW_SECONDS|(TCP|UDP)_VERTICAL_PORTS|SUBNET_(HOSTS|PORTS|ENDPOINTS)|COOLDOWN_SECONDS)=' \
-  /etc/ezhik-torrent-guard/settings.env
-```
-
-Примеры событий:
+## Как работает защита
 
 ```text
-[BT EXACT] client=12345 sockets=1 ...
-[FROZEN] client=12345 duration=15m reason=bittorrent ...
-[SCAN DETECTED] client=12345 reason=vertical-port-scan action=WOULD_BLOCK ...
-[BLOCKED] client=12345 duration=permanent manual_unblock=remnawave-panel
+             RemnaNode (Docker)                         Нода
+  клиент ──► Xray ── access/info логи в RAM ──► агент Ezhik Guard ─┐
+                │                                   ▲               │ события
+                └── исходящий сокет ── Suricata + strict nDPI ┘     ▼
+                                                              Панель Ezhik Guard
+                                                         политика · реестр блокировок
+                                                                    │
+                                                         Remnawave API (2.x/3.x)
 ```
 
-## Аварийное управление Port Guard
+- **BitTorrent**: санкция только после однозначного сопоставления nDPI-алерта
+  с реальным сокетом Xray и ID клиента; неоднозначные случаи пропускаются.
+- **P2P fan-out**: учитываются UDP/TCP-назначения на портах ≥ 1024, кроме
+  типовых сервисных (QUIC/HTTPS, STUN, Zoom и т. п.); порог по умолчанию —
+  120 хостов из 40 разных сетей /16 за 60 с (TCP: 150 / 50).
+- **Сканирование**: 50 TCP-портов (100 UDP) одного IP или 16 хостов / 50 портов
+  / 100 назначений в одной /24 за 60 с.
 
-Настройки находятся в:
+Все пороги настраиваются в «Настройки → Защита → Пороги». Новые правила стоит
+сначала проверить в режиме наблюдения на реальной нагрузке.
 
-```text
-/etc/ezhik-torrent-guard/settings.env
-```
+Правила безопасности блокировок (из 1.x, сохранены): блокируется только
+пользователь в статусе ACTIVE; уже отключённый кем-то пользователь никогда не
+включается автоматически; неоднозначные ответы API (таймаут, 5xx) запоминаются
+и распознаются при повторе; автоматическое включение — только для «своей»
+блокировки, если пользователь не был пересоздан.
 
-Команды ниже меняют только детектор сканирования. Torrent Guard продолжит
-работать в своём текущем режиме.
+## Сертификаты
 
-### Срочно перевести Port Guard в OBSERVE
+1. «Настройки → ACME и DNS»: e-mail Let's Encrypt, DNS-провайдер.
+2. «Сертификаты → Новый сертификат»: домены (например, `example.com`,
+   `*.example.com`, `*.test.example.com`), провайдер, тип ключа.
+3. На странице ноды → «SSL-сертификат»: выбрать сертификат, домен ноды (для
+   проверки покрытия), куда ставить (Docker-контейнер, systemd или файлы) и как
+   применять (перезапуск, без перезапуска — если в профиле Xray включён
+   `ocspStapling`, или своя команда).
 
-Обнаружение и уведомления продолжатся, но новые блокировки за сканирование
-применяться не будут:
+Для `*.sub.test.example.com` TXT-запись проверки — `_acme-challenge.sub.test.example.com`;
+для `example.com` и `*.example.com` используется одна запись с двумя значениями.
+С провайдером acme-dns для каждого такого имени один раз создаётся CNAME.
 
-```bash
-sed -i \
-  -e 's/^EZHIK_SCAN_ENABLED=.*/EZHIK_SCAN_ENABLED=1/' \
-  -e 's/^EZHIK_SCAN_DRY_RUN=.*/EZHIK_SCAN_DRY_RUN=1/' \
-  /etc/ezhik-torrent-guard/settings.env
-chmod 600 /etc/ezhik-torrent-guard/settings.env
-systemctl restart ezhik-torrent-guard
-```
+## Безопасность
 
-Проверка:
+- агенты доверяют только собственному CA панели (ключ пиннится в команде
+  установки); токен ноды индивидуален и хранится с правами `0600`;
+- секреты (токены Remnawave, Cloudflare, Telegram) зашифрованы в базе панели;
+- вход в панель: scrypt, HttpOnly-сессии, CSRF-защита, ограничение попыток;
+- панель работает от отдельного пользователя с ограничениями systemd;
+- сетевые метаданные — только в RAM (`/dev/shm`), без PCAP и payload;
+- Ezhik Guard не добавляет правила iptables и не перехватывает трафик (пассивный
+  AF_PACKET-сенсор).
 
-```bash
-journalctl -u ezhik-torrent-guard -n 30 --no-pager
-```
+## Файлы
 
-В заголовке запуска должно быть:
-
-```text
-Port-scan protection: OBSERVE
-```
-
-### Полностью отключить только Port Guard
-
-Torrent detection и его санкции останутся активны:
-
-```bash
-sed -i 's/^EZHIK_SCAN_ENABLED=.*/EZHIK_SCAN_ENABLED=0/' \
-  /etc/ezhik-torrent-guard/settings.env
-chmod 600 /etc/ezhik-torrent-guard/settings.env
-systemctl restart ezhik-torrent-guard
-```
-
-В журнале должно быть:
-
-```text
-Port-scan protection: DISABLED
-```
-
-### Вернуть Port Guard в LIVE
-
-```bash
-sed -i \
-  -e 's/^EZHIK_SCAN_ENABLED=.*/EZHIK_SCAN_ENABLED=1/' \
-  -e 's/^EZHIK_SCAN_DRY_RUN=.*/EZHIK_SCAN_DRY_RUN=0/' \
-  /etc/ezhik-torrent-guard/settings.env
-chmod 600 /etc/ezhik-torrent-guard/settings.env
-systemctl restart ezhik-torrent-guard
-```
-
-В журнале должно быть:
-
-```text
-Port-scan protection: LIVE REMNAWAVE
-```
-
-### Экстренно остановить весь Guard
-
-Останавливает и Torrent Guard, и Port Guard. Xray/RemnaNode продолжает работать:
-
-```bash
-systemctl stop ezhik-torrent-guard
-```
-
-Вернуть защиту:
-
-```bash
-systemctl start ezhik-torrent-guard
-```
-
-> Остановка сервиса или перевод в `OBSERVE` не разблокирует клиентов, санкции к
-> которым уже были применены. Временные санкции продолжат обработку после
-> запуска Guard; бессрочно отключённого клиента можно включить вручную в
-> Remnawave Panel.
-
-## Защищённые клиенты
-
-Во время установки можно указать numeric client IDs, которые Guard никогда не
-будет отключать:
-
-```text
-123,456,789
-```
-
-Чтобы временно запретить автоматический unfreeze конкретного клиента:
-
-```bash
-echo 12345 >> /etc/ezhik-torrent-guard/hold.txt
-```
-
-## Файлы и журналы
-
-```text
-/opt/ezhik-torrent-guard/                    приложение
-/etc/ezhik-torrent-guard/settings.env        рабочие настройки
-/etc/ezhik-torrent-guard/api.env             Remnawave API credentials
-/etc/ezhik-torrent-guard/telegram.env        Telegram credentials
-/etc/ezhik-torrent-guard/hold.txt            запрет auto-unfreeze
-/var/lib/ezhik-torrent-guard/                 sanction state и incident reports
-/var/log/ezhik-torrent-guard-install.log      журнал установки
-```
-
-Файлы с credentials создаются с правами `0600` и не входят в репозиторий.
-
-## Приватность и безопасность
-
-- Xray access/info и Suricata fast log находятся в `/dev/shm`;
-- EVE и PCAP logging отключены;
-- packet payload в incident report не сохраняется;
-- raw connection metadata очищается из RAM по TTL;
-- хранится не более 100 port-scan отчётов с правами `0600`;
-- Telegram token не передаётся через systemd `EnvironmentFile` и не выводится
-  в журнал;
-- перед санкцией проверяются numeric ID, UUID и текущий статус клиента;
-- Guard не добавляет правила `iptables` и не использует inline `NFQUEUE`.
+| Где | Что |
+|---|---|
+| `/opt/ezhik-guard/panel`, `/etc/ezhik-guard/panel`, `/var/lib/ezhik-guard/panel` | панель, её настройки и база |
+| `/opt/ezhik-guard/agent/{releases,current,previous}` | релизы агента |
+| `/etc/ezhik-guard/agent`, `/var/lib/ezhik-guard/agent` | учётные данные ноды, состояние |
+| `/opt/ezhik-suricata-8.0.6` | Suricata + strict nDPI runtime |
+| `journalctl -u ezhik-guard-panel` / `-u ezhik-guard-agent` | журналы |
 
 ## Удаление
 
-Обычное удаление с сохранением конфигурации и sanction state:
+Ноду лучше удалять в панели («Удалить ноду»): агент сам удалит свои компоненты.
+Вручную:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ezhikdev/ezhik-torrent-guard/main/uninstall.sh | bash
+bash /opt/ezhik-guard/panel/current/uninstall.sh --agent   # агент
+bash /opt/ezhik-guard/panel/current/uninstall.sh --panel   # панель (с резервной копией)
 ```
-
-Полное удаление:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/ezhikdev/ezhik-torrent-guard/main/uninstall.sh \
-  -o /tmp/ezhik-tg-uninstall.sh
-bash /tmp/ezhik-tg-uninstall.sh --purge
-```
-
-Uninstaller не продолжит обычное удаление при активной локальной санкции, чтобы
-не оставить подписку отключённой навсегда. Принудительный `--force` следует
-использовать только при осознанном ручном восстановлении.
 
 ## Ограничения
 
-- анализируются публичные IPv4 TCP/UDP destinations;
-- IPv6 и ICMP пока не анализируются;
-- процессы, запущенные непосредственно на VPS, нельзя связать с клиентом
-  Remnawave;
-- трафик по отдельному маршруту в обход Xray не может быть атрибутирован VPN-ID;
-- Port Guard является поведенческой, а не inline-защитой: первые запросы проходят
-  до достижения порога;
-- любой поведенческий детектор требует первоначальной проверки в `OBSERVE` на
-  реальной нагрузке конкретной ноды.
+- анализируются публичные IPv4-назначения; IPv6 и ICMP пока не анализируются;
+- Suricata-runtime собран для amd64 (Ubuntu 22.04 и 24.04);
+- процессы на самом VPS и трафик в обход Xray нельзя связать с клиентом;
+- поведенческие детекторы срабатывают по порогу: первые запросы проходят;
+- ручной DNS-режим сертификатов требует ваших действий при каждом продлении —
+  для автоматики используйте Cloudflare или acme-dns.
 
-Проект не гарантирует обнаружение всех будущих вариантов протоколов или полное
-отсутствие ложных срабатываний. Перед включением `LIVE` рекомендуется проверить
-обычный браузинг, видео, игры и контролируемый тест собственной инфраструктуры.
+## Разработка
+
+```text
+agent/   агент ноды (Python stdlib)      panel/  панель (FastAPI + SQLite)
+web/     интерфейс (Preact + Vite)       packaging/ установка агента, самообновление
+tests/   unit, mock Remnawave/Cloudflare, интеграционный стенд
+```
+
+```bash
+python -m unittest discover -s tests/agent -t tests/agent
+python -m unittest discover -s tests/panel -t tests/panel
+python scripts/build_release.py          # dist/ezhik-guard.tar.gz
+```
+
+Релиз публикуется GitHub Actions по тегу `v<VERSION>`. Suricata-runtime
+собирается отдельным workflow «Build Suricata runtime» только при изменении
+`RUNTIME.env`. Подробности для хостеров: [docs/HOSTER_PORT_SCAN_PROTECTION_RU.md](docs/HOSTER_PORT_SCAN_PROTECTION_RU.md).

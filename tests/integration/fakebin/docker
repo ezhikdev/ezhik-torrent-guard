@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Docker CLI stand-in for rootless integration tests.
+
+One container (EZHIK_FAKE_CONTAINER_NAME, default remnanode) whose filesystem
+lives in $EZHIK_FAKE_CONTAINER. Container paths are mapped into that dir.
+"""
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(os.environ.get("EZHIK_FAKE_CONTAINER", "/tmp/fake-container"))
+NAME = os.environ.get("EZHIK_FAKE_CONTAINER_NAME", "remnanode")
+LOG = os.environ.get("EZHIK_FAKE_LOG")
+
+
+def log(*args):
+    if LOG:
+        with open(LOG, "a") as handle:
+            handle.write("docker " + " ".join(args) + "\n")
+
+
+def cpath(path):
+    return str(ROOT / path.lstrip("/"))
+
+
+def remap(text):
+    """Rewrite container paths used in `docker exec sh -c` scripts."""
+    return re.sub(r"(?<![\w.])/(dev/shm|etc/xray)/", lambda m: cpath("/" + m.group(1)) + "/", text)
+
+
+def main(argv):
+    log(*argv)
+    if not argv:
+        return 1
+    cmd = argv[0]
+    if cmd == "version":
+        print("27.5.1")
+        return 0
+    if cmd == "info":
+        return 0
+    if cmd == "ps":
+        print(NAME)
+        return 0
+    if cmd == "inspect":
+        if argv[-1] != NAME:
+            print(f"Error: No such object: {argv[-1]}", file=sys.stderr)
+            return 1
+        fmt = argv[argv.index("--format") + 1] if "--format" in argv else ""
+        out = fmt.replace("{{.State.Running}}", "true").replace("{{.State.Status}}", "running") \
+            .replace("{{.State.StartedAt}}", "2026-10-16T00:00:00Z").replace("{{.Config.Image}}", "remnawave/node:latest")
+        print(out)
+        return 0
+    if cmd == "top":
+        print("UID PID PPID C STIME TTY TIME CMD")
+        print("root 100 1 0 00:00 ? 00:00:01 /usr/local/bin/xray run -config /etc/xray/config.json")
+        return 0
+    if cmd == "restart":
+        print(argv[1])
+        return 0
+    if cmd == "cp":
+        src, dst = argv[1], argv[2]
+        if dst.startswith(NAME + ":"):
+            target = Path(cpath(dst.split(":", 1)[1]))
+            if Path(src).is_dir():
+                shutil.copytree(src, target / Path(src).name, dirs_exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, target)
+            return 0
+        return 1
+    if cmd == "exec":
+        args = argv[1:]
+        while args and args[0].startswith("-"):
+            args = args[1:]
+        if not args or args[0] != NAME:
+            print("Error: No such container", file=sys.stderr)
+            return 1
+        args = args[1:]
+        if args[0] == "sh":
+            script = remap(args[-1])
+            os.execvp("sh", ["sh", "-c", script])
+        mapped = [args[0]] + [cpath(a) if a.startswith("/") else a for a in args[1:]]
+        if args[0] == "tail":
+            os.execvp("tail", mapped)
+        return subprocess.call(mapped)
+    print(f"fake docker: unsupported {cmd}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
