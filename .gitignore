@@ -28,3 +28,8 @@ Thumbs.db
 *.tar.zst
 *.zip
 dist/
+
+# Local test credentials and web build
+TEST-SERVER.txt
+web/node_modules/
+web/dist/
