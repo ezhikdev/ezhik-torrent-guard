@@ -6,11 +6,13 @@ import { CertificateDetail } from './pages/CertificateDetail';
 import { Certificates } from './pages/Certificates';
 import { Dashboard } from './pages/Dashboard';
 import { Events } from './pages/Events';
+import { Firewall } from './pages/Firewall';
 import { Login } from './pages/Login';
 import { NodeDetail } from './pages/NodeDetail';
 import { Nodes } from './pages/Nodes';
 import { Sanctions } from './pages/Sanctions';
 import { Settings } from './pages/Settings';
+import { Sites } from './pages/Sites';
 import { theme, toasts, toggleTheme, useRoute, useSignal } from './state';
 
 const NAV = [
@@ -82,6 +84,8 @@ function Router() {
   if (parts[0] === 'sanctions') return <Sanctions />;
   if (parts[0] === 'certificates' && parts[1]) return <CertificateDetail id={parts[1]} />;
   if (parts[0] === 'certificates') return <Certificates />;
+  if (parts[0] === 'firewall') return <Firewall />;
+  if (parts[0] === 'sites') return <Sites />;
   if (parts[0] === 'settings') return <Settings tab={parts[1]} />;
   return <Dashboard />;
 }
@@ -144,6 +148,14 @@ export function App() {
           );
         })}
         <div class="nav-section">Управление</div>
+        <Link to="/firewall" class={`nav-item ${isActive('/firewall') ? 'is-active' : ''}`}>
+          <Icon name="shield" size={19} />
+          Firewall
+        </Link>
+        <Link to="/sites" class={`nav-item ${isActive('/sites') ? 'is-active' : ''}`}>
+          <Icon name="globe" size={19} />
+          Сайты
+        </Link>
         <Link to="/settings/protection" class={`nav-item ${isActive('/settings') ? 'is-active' : ''}`}>
           <Icon name="settings" size={19} />
           Настройки

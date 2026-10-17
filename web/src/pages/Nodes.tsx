@@ -318,6 +318,12 @@ export function Nodes() {
           <Button size="sm" variant="soft" onClick={() => bulk('torrent_enabled', false, 'Торренты выключены')}>выкл</Button>
           <Button size="sm" variant="soft" icon="radar" onClick={() => bulk('scan_enabled', true, 'Сканирование включено')}>Скан вкл</Button>
           <Button size="sm" variant="soft" onClick={() => bulk('scan_enabled', false, 'Сканирование выключено')}>выкл</Button>
+          <Button size="sm" variant="soft" icon="shield" onClick={async () => {
+            if (await confirmDialog({ title: `Включить firewall на ${selected.size} нодах?`, text: 'На каждой ноде будет закрыто всё, что не разрешено её планом. Ноды, не приславшие список портов, пропускают включение. SSH остаётся открытым, при потере связи — автоматический откат.', confirm: 'Включить' })) bulk('firewall_enabled', true, 'Firewall включается');
+          }}>Firewall вкл</Button>
+          <Button size="sm" variant="soft" onClick={() => bulk('firewall_enabled', false, 'Firewall выключается')}>выкл</Button>
+          <Button size="sm" variant="soft" icon="zap" onClick={() => bulk('bbr', true, 'BBR включается')}>BBR вкл</Button>
+          <Button size="sm" variant="soft" onClick={() => bulk('bbr', false, 'BBR выключается')}>выкл</Button>
           <Button size="sm" variant="soft" icon="stethoscope" onClick={() => bulk('diagnose', undefined, 'Диагностика запрошена')}>Диагностика</Button>
           <button type="button" class="icon-btn icon-btn--sm" style={{ background: 'transparent', color: 'inherit', borderColor: 'transparent' }} onClick={() => setSelected(new Set())} title="Снять выделение">
             <Icon name="x" size={15} />

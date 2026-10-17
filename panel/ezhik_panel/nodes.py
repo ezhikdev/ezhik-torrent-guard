@@ -9,7 +9,8 @@ import threading
 import time
 import uuid
 
-from . import security
+from . import firewall as fw
+from . import nginx_routes, security
 from .db import loads
 from .events import node_flag
 
@@ -41,6 +42,8 @@ class NodeService:
         self._lock = threading.Lock()
         self._last_metric = {}
         self._last_seen_mem = {}
+        self.sites = None
+        self.remnawave_cache = {}
 
     # --------------------------------------------------------------- wake
 
@@ -126,8 +129,27 @@ class NodeService:
             "synced": bool(row["applied_generation"] and row["applied_generation"] == self.generation_for(row)),
             "legacy": report.get("legacy"),
             "outbox": report.get("outbox"),
+            "nginx": nginx_routes.node_config(row),
+            "nginx_state": report.get("nginx") or {},
+            "firewall_state": report.get("firewall") or {},
+            "firewall_override": loads(row.get("firewall"), {}) or {},
+            "bbr": row.get("bbr"),
+            "bbr_state": report.get("bbr") or {},
+            "site_id": row.get("site_id"),
+            "site_state": report.get("site") or {},
+            "remnawave_node_hint": row.get("remnawave_node"),
         }
         if detail:
+            plan_cfg, plan = self.firewall_plan(row)
+            plan["applied_enabled"] = plan_cfg["enabled"]
+            out["firewall"] = plan
+            out["ports"] = report.get("ports") or {}
+            rw = self.remnawave_node(row)
+            out["remnawave"] = {"uuid": rw.get("uuid"), "name": rw.get("name"), "address": rw.get("address"),
+                                "port": rw.get("port"), "inbounds": [
+                                    {k: i.get(k) for k in ("tag", "type", "network", "security", "port")}
+                                    for i in ((rw.get("configProfile") or {}).get("activeInbounds") or [])]} if rw else None
+            out["route_checks"] = nginx_routes.check_routes(out["nginx"], rw, (report.get("ports") or {}).get("container_network"))
             out["diagnostics"] = loads(row["diagnostics"], None)
             out["diagnostics_at"] = row["diagnostics_at"]
             out["facts"] = facts
@@ -250,6 +272,7 @@ class NodeService:
             "log_max_bytes": protection["log_max_bytes"],
             "remove_legacy": protection.get("remove_legacy", True),
             "cert": None,
+            "site": None,
             "cert_target": loads(node["cert_target"], {}) or {},
             "cert_remove": bool(node["cert_remove"]),
             "agent": None,
@@ -259,11 +282,57 @@ class NodeService:
             if cert and cert["version"]:
                 cfg["cert"] = {"id": cert["id"], "name": cert["name"], "version": cert["version"],
                                "domains": loads(cert["domains"], [])}
+        nginx_cfg = nginx_routes.node_config(node)
+        if not nginx_cfg["server_name"] and node.get("domain"):
+            nginx_cfg["server_name"] = node["domain"]
+        cfg["nginx"] = nginx_cfg
+        if nginx_cfg["mode"] == "frontend" and self.sites:
+            site, version = self.sites.effective_for(node)
+            if site:
+                sha = self.db.scalar("SELECT sha256 FROM site_versions WHERE site_id=? AND version=?", (site["id"], version))
+                cfg["site"] = {"id": site["id"], "name": site["name"], "version": version, "sha256": sha,
+                               "url": f"/agent/v1/site/{site['id']}/{version}.tar.gz"}
+        network = self.settings.network()
+        cfg["bbr"] = bool(node["bbr"]) if node.get("bbr") is not None else (True if network["bbr_default"] else None)
+        cfg["firewall"] = self.firewall_plan(node)[0]
         if node["desired_agent_version"]:
             version, sha, _path = self.releases.agent_bundle()
             if node["desired_agent_version"] == version:
                 cfg["agent"] = {"version": version, "sha256": sha, "url": f"/agent/v1/agent-bundle/{version}.tar.gz"}
         return cfg
+
+    def remnawave_node(self, node):
+        """Matching Remnawave node from the background cache (never blocks)."""
+        cache = (self.remnawave_cache or {}).get("nodes") or []
+        facts = loads(node.get("facts"), {}) or {}
+        addresses = {facts.get("wan_ip"), node.get("last_ip"), node.get("wan_ip"), node.get("domain")}
+        hint = node.get("remnawave_node")
+        for item in cache:
+            if hint and item.get("uuid") == hint:
+                return item
+        for item in cache:
+            if str(item.get("address") or "").strip() in addresses:
+                return item
+        return None
+
+    def firewall_plan(self, node):
+        rw = self.remnawave_node(node)
+        report = loads(node.get("report"), {}) or {}
+        inbound_ports = []
+        for inbound in ((rw or {}).get("configProfile") or {}).get("activeInbounds") or []:
+            raw = inbound.get("rawInbound") or {}
+            listen = str(raw.get("listen") or "0.0.0.0")
+            if inbound.get("port") and not listen.startswith("127.") and listen not in ("::1", "localhost"):
+                inbound_ports.append((int(inbound["port"]), fw.inbound_protos(raw)))
+        nginx = nginx_routes.node_config(node)
+        internal = [r["upstream_port"] for r in nginx.get("routes") or []
+                    if nginx.get("mode") == "frontend" and r.get("enabled")
+                    and nginx_routes.is_local(r.get("upstream_host"))]
+        return fw.plan(node, self.settings.firewall(), report,
+                       remnawave_url=self.settings.remnawave().get("url"),
+                       remnanode_port=(rw or {}).get("port"),
+                       nginx_ports=nginx_routes.public_ports(nginx),
+                       inbound_ports=inbound_ports, internal_ports=internal)
 
     def generation_for(self, node, config=None):
         config = config if config is not None else self.desired_config(node)
@@ -281,7 +350,8 @@ class NodeService:
             "agent_version": str(body.get("agent_version") or node["agent_version"] or "")[:32],
             "applied_generation": str(body.get("applied_generation") or "")[:32] or None,
             "report": json.dumps({k: body.get(k) for k in (
-                "metrics", "detector", "components", "cert", "runtime", "update", "legacy", "outbox")},
+                "metrics", "detector", "components", "cert", "runtime", "update", "legacy", "outbox",
+                "ports", "nginx", "firewall", "bbr", "site")},
                 ensure_ascii=False)[:200000],
         }
         if isinstance(facts, dict):
@@ -422,6 +492,25 @@ class NodeService:
             fields["cert_remove"] = 1 if (not cert_id and data.get("cert_remove")) else 0
         if "cert_target" in data:
             fields["cert_target"] = json.dumps(_cert_target(data["cert_target"] or {}))
+        if "nginx" in data:
+            try:
+                fields["nginx"] = json.dumps(nginx_routes.validate(data["nginx"]))
+            except nginx_routes.RouteError as exc:
+                raise NodeError(str(exc))
+        if "firewall" in data:
+            try:
+                fields["firewall"] = json.dumps(fw.validate_node(data["firewall"]))
+            except fw.FirewallError as exc:
+                raise NodeError(str(exc))
+        if "bbr" in data:
+            fields["bbr"] = _tri(data["bbr"])
+        if "site_id" in data:
+            site_id = data["site_id"] or None
+            if site_id not in (None, "builtin") and not self.db.scalar("SELECT 1 FROM sites WHERE id=?", (site_id,)):
+                raise NodeError("Сайт не найден")
+            fields["site_id"] = site_id
+        if "remnawave_node" in data:
+            fields["remnawave_node"] = (data["remnawave_node"] or "").strip()[:64] or None
         if fields:
             sets = ", ".join(f"{k}=?" for k in fields)
             self.db.execute(f"UPDATE nodes SET {sets} WHERE id=?", (*fields.values(), node_id))
@@ -437,6 +526,11 @@ class NodeService:
                     self.request_update(node_id, actor)
                 elif action in ("torrent_enabled", "scan_enabled"):
                     self.update_node(node_id, {action: value}, actor)
+                elif action == "firewall_enabled":
+                    override = loads(self.get(node_id).get("firewall"), {}) or {}
+                    self.update_node(node_id, {"firewall": {**override, "enabled": None if _tri(value) is None else bool(_tri(value))}}, actor)
+                elif action == "bbr":
+                    self.update_node(node_id, {"bbr": value}, actor)
                 elif action == "diagnose":
                     self.command(node_id, "diagnose", actor=actor)
                 elif action == "status":

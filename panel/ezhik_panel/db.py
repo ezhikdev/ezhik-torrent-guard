@@ -189,6 +189,33 @@ MIGRATIONS = [
     );
     CREATE INDEX IF NOT EXISTS audit_at ON audit(at DESC);
     """,
+    # 2: firewall, nginx frontend, BBR, stub sites
+    """
+    ALTER TABLE nodes ADD COLUMN nginx TEXT;
+    ALTER TABLE nodes ADD COLUMN firewall TEXT;
+    ALTER TABLE nodes ADD COLUMN bbr INTEGER;
+    ALTER TABLE nodes ADD COLUMN site_id TEXT;
+    ALTER TABLE nodes ADD COLUMN remnawave_node TEXT;
+    CREATE TABLE IF NOT EXISTS sites (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        is_default INTEGER NOT NULL DEFAULT 0,
+        current_version TEXT,
+        draft_version TEXT,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS site_versions (
+        site_id TEXT NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+        version TEXT NOT NULL,
+        files INTEGER NOT NULL,
+        size INTEGER NOT NULL,
+        sha256 TEXT NOT NULL,
+        note TEXT,
+        created_at REAL NOT NULL,
+        PRIMARY KEY (site_id, version)
+    );
+    """,
 ]
 
 

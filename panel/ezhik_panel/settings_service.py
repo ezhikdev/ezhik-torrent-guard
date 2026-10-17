@@ -46,7 +46,9 @@ DEFAULT_ACME = {
     "directory": "https://acme-v02.api.letsencrypt.org/directory",
     "renew_days": 30,
 }
-DEFAULT_PANEL = {"web_cert_id": None, "public_host": "", "timezone": "Europe/Moscow"}
+DEFAULT_PANEL = {"web_cert_id": None, "public_host": "", "timezone": "Europe/Moscow",
+                 "domain": "", "domain_cert_id": None, "http_port": 0, "https_port": 0}
+DEFAULT_NETWORK = {"bbr_default": False}
 
 LIMITS = {
     ("torrent", "freeze_seconds"): (60, 30 * 86400),
@@ -193,6 +195,34 @@ class SettingsService:
         self.db.set_json("acme", merged)
         self.db.audit(actor, "settings.acme", detail=merged)
 
+    # -------------------------------------------------------------- firewall
+
+    def firewall(self):
+        from .firewall import DEFAULT_FIREWALL, validate_global
+
+        return validate_global({}, self.db.get_json("firewall", {}) or {}) if self.db.get_json("firewall")             else validate_global({}, DEFAULT_FIREWALL)
+
+    def set_firewall(self, value, actor="system"):
+        from .firewall import validate_global
+
+        merged = validate_global(value, self.firewall())
+        self.db.set_json("firewall", merged)
+        self.db.audit(actor, "settings.firewall", detail={"enabled_default": merged["enabled_default"],
+                                                           "rules": len(merged["rules"])})
+        self._changed("firewall")
+        return merged
+
+    def network(self):
+        return _merge(DEFAULT_NETWORK, self.db.get_json("network", {}))
+
+    def set_network(self, value, actor="system"):
+        merged = _merge(self.network(), value)
+        merged["bbr_default"] = bool(merged["bbr_default"])
+        self.db.set_json("network", merged)
+        self.db.audit(actor, "settings.network", detail=merged)
+        self._changed("network")
+        return merged
+
     # ----------------------------------------------------------------- panel
 
     def panel(self):
@@ -200,6 +230,10 @@ class SettingsService:
 
     def set_panel(self, value, actor="system"):
         merged = _merge(self.panel(), value)
+        for key in ("http_port", "https_port"):
+            merged[key] = int(merged.get(key) or 0)
+            if merged[key] and not 1 <= merged[key] <= 65535:
+                raise ValidationError(f"{key}: 1-65535")
         self.db.set_json("panel", merged)
         self.db.audit(actor, "settings.panel", detail=merged)
         self._changed("panel")

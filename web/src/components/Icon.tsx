@@ -32,6 +32,12 @@ const paths: Record<string, JSX.Element> = {
   logout: <path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 17l-5-5 5-5M5 12h11" />,
   arrowUpRight: <path d="M7 17 17 7M8 7h9v9" />,
   chevronRight: <path d="m9 6 6 6-6 6" />,
+  eye: (
+    <>
+      <path d="M2.5 12S6 5 12 5s9.5 7 9.5 7-3.5 7-9.5 7-9.5-7-9.5-7Z" />
+      <circle cx="12" cy="12" r="3" />
+    </>
+  ),
   shield: (
     <>
       <path d="M12 3 4.5 6v5.5c0 4.6 3.1 8.4 7.5 9.5 4.4-1.1 7.5-4.9 7.5-9.5V6L12 3Z" />

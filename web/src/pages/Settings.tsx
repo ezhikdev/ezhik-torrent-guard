@@ -2,11 +2,12 @@ import { useEffect, useState } from 'preact/hooks';
 import { api } from '../api';
 import { Icon } from '../components/Icon';
 import {
-  Badge, Button, Callout, CodeBox, Empty, ErrorState, Field, Loading, Modal, PageHead, Segmented, Switch, Tabs, ToggleRow,
+  Badge, Button, Callout, CodeBox, Empty, ErrorState, Field, Link, Loading, Modal, PageHead, Segmented, Switch, Tabs, ToggleRow,
   confirmDialog, useAction, useData,
 } from '../components/ui';
 import { ago, bytes, dateTime } from '../format';
 import { navigate } from '../state';
+import { certStatus } from './Certificates';
 
 type Tab = 'protection' | 'remnawave' | 'notifications' | 'certificates' | 'panel' | 'security' | 'updates' | 'audit';
 
@@ -327,6 +328,8 @@ function PanelTab({ settings, reload }: { settings: any; reload: () => void }) {
   const { data } = useData(() => api.get('/api/certificates'), []);
   const { busy, run } = useAction();
   return (
+    <div class="stack">
+    <DomainCard />
     <div class="card">
       <div class="stack">
         <div class="form-grid">
@@ -347,6 +350,104 @@ function PanelTab({ settings, reload }: { settings: any; reload: () => void }) {
         <Callout icon="info">Сертификат для веб-интерфейса применяется сразу, без перезапуска. Агенты продолжают проверять панель по её CA, поэтому смена не влияет на ноды.</Callout>
         <div class="form-actions">
           <Button variant="primary" loading={busy === 's'} onClick={() => run('s', async () => { await api.put('/api/settings/panel', { public_host: host, web_cert_id: cert || null }); reload(); }, 'Сохранено')}>Сохранить</Button>
+        </div>
+      </div>
+    </div>
+    </div>
+  );
+}
+
+function Check({ ok, children }: { ok: boolean | null | undefined; children: any }) {
+  return (
+    <div class="row small" style={{ gap: '8px' }}>
+      <Icon name={ok ? 'check' : ok === false ? 'x' : 'clock'} size={15} />
+      <span class={ok ? '' : ok === false ? 'bad-text' : 'faint'}>{children}</span>
+    </div>
+  );
+}
+
+function DomainCard() {
+  const { data, reload } = useData(() => api.get('/api/system/domain'), [], 5000);
+  const { data: certs } = useData(() => api.get('/api/certificates'), []);
+  const [domain, setDomain] = useState('');
+  const [email, setEmail] = useState('');
+  const [challenge, setChallenge] = useState('http01');
+  const [listen443, setListen443] = useState(true);
+  const [redirect, setRedirect] = useState(true);
+  const [agents, setAgents] = useState(false);
+  const [check, setCheck] = useState<any>(null);
+  const { busy, run } = useAction();
+  const [loaded, setLoaded] = useState(false);
+  useEffect(() => {
+    if (!data || loaded) return;
+    setLoaded(true);
+    if (!data.domain) return;
+    setDomain(data.domain);
+    setListen443(!!data.https_port);
+    setRedirect(!!data.http_port);
+    if (data.certificate?.provider_id) setChallenge(data.certificate.provider_id);
+  }, [data]);
+  if (!data) return <div class="card"><Loading /></div>;
+  const cert = data.certificate;
+  const st = cert ? certStatus(cert) : null;
+  const providers: any[] = certs?.providers || [];
+  const doCheck = () => run('check', async () => setCheck(await api.post('/api/system/domain/check', { domain })));
+  const apply = () => run('apply', async () => {
+    await api.post('/api/system/domain/apply', { domain, email, challenge, listen_443: listen443, redirect_http: redirect, agents_use_domain: agents });
+    reload(true);
+  }, 'Выпуск сертификата запущен');
+  const base = `https://${data.domain}${data.https_port === 443 ? '' : `:${data.web_port}`}`;
+  return (
+    <div class="card">
+      <div class="card-head">
+        <div class="card-title row" style={{ gap: '8px' }}><Icon name="lock" size={17} /> Домен и HTTPS панели</div>
+        {data.active ? <Badge tone="ok" size="sm">HTTPS по домену активен</Badge> : data.domain ? <Badge tone="warn" size="sm">настраивается</Badge> : <Badge size="sm">по IP</Badge>}
+      </div>
+      <div class="stack">
+        {data.domain && (
+          <dl class="kv">
+            <dt>Домен</dt><dd class="mono">{data.domain}</dd>
+            <dt>Сертификат</dt><dd>{cert ? <><Badge tone={st!.tone as any} size="sm">{st!.text}</Badge> {cert.not_after && <span class="tiny faint">до {dateTime(cert.not_after)}</span>} <Link to={`/certificates/${cert.id}`} class="tiny">подробнее</Link></> : '—'}</dd>
+            <dt>Порты</dt><dd class="mono small">{data.web_port} (всегда){data.https_port ? ' · 443' : ''}{data.http_port ? ' · 80 → 301' : ''}
+              {Object.entries(data.listeners?.errors || {}).map(([p, e]) => <div class="bad-text tiny" key={p}>порт {p}: {String(e)}</div>)}</dd>
+            {data.active && <><dt>Адрес</dt><dd><a class="mono small" href={base} target="_blank" rel="noopener">{base}</a></dd></>}
+          </dl>
+        )}
+        {cert?.last_error && !cert.running && <Callout tone="bad">{cert.last_error}</Callout>}
+        {data.domain && cert?.provider_id === 'http01' && !data.http_port && <Callout tone="warn">Сертификат выпускается через HTTP-01, но порт 80 панели выключен — автоматическое продление не пройдёт. Включите редирект HTTP или выберите DNS-провайдера.</Callout>}
+        <Field label="Домен панели" hint="A/AAAA-записи домена должны указывать на этот сервер">
+          <div class="row">
+            <input class="input input--mono grow" value={domain} placeholder="panel.example.com" onInput={(e) => { setDomain(e.currentTarget.value); setCheck(null); }} />
+            <Button loading={busy === 'check'} disabled={!domain.trim()} onClick={doCheck}>Проверить</Button>
+          </div>
+        </Field>
+        {check && (
+          <div class="stack" style={{ gap: '4px' }}>
+            <Check ok={check.dns_ok}>DNS: A {check.a.join(', ') || '—'}{check.aaaa.length ? ` · AAAA ${check.aaaa.join(', ')}` : ''} · адреса сервера {check.server.join(', ')}{check.dns_partial ? ' — указывают не все записи' : ''}</Check>
+            <Check ok={check.http?.ok ?? null}>HTTP (порт 80): {check.http ? (check.http.ok ? 'доступен' : check.http.error || `код ${check.http.status}`) : 'порт 80 панели ещё не включён — проверится при выпуске'}</Check>
+            <Check ok={check.https?.ok ?? null}>HTTPS: {check.https ? (check.https.ok ? 'доверенный сертификат' : 'пока нет доверенного сертификата') : '—'}</Check>
+          </div>
+        )}
+        <div class="form-grid">
+          <Field label="Проверка Let's Encrypt">
+            <select class="select" value={challenge} onChange={(e) => setChallenge(e.currentTarget.value)}>
+              <option value="http01">HTTP-01 (порт 80 этого сервера)</option>
+              {providers.map((p) => <option value={p.id} key={p.id}>DNS-01: {p.name}</option>)}
+            </select>
+          </Field>
+          {!data.acme_email && <Field label="E-mail для Let's Encrypt"><input class="input" type="email" value={email} onInput={(e) => setEmail(e.currentTarget.value)} /></Field>}
+        </div>
+        <ToggleRow title="Слушать стандартный порт 443" desc={`Панель будет открываться как https://домен/. Порт ${data.web_port} продолжит работать.`} on={listen443} onChange={setListen443} />
+        <ToggleRow title="Порт 80: редирект на HTTPS" desc="Нужен для HTTP-01 и его продления" on={redirect || challenge === 'http01'} onChange={setRedirect} />
+        <ToggleRow title="Агенты подключаются по домену" desc="Новые команды установки будут использовать домен. Работающие агенты продолжают по старому адресу — канал защищён CA панели." on={agents} onChange={setAgents} />
+        <Callout icon="info">Переход безопасен: доступ по IP и порту {data.web_port} сохраняется, интерфейс переключится на новый сертификат только после успешного выпуска. Если на этом же сервере стоит нода с Nginx Frontend, порт 80 занят Nginx — используйте DNS-01.</Callout>
+        <div class="form-actions">
+          {data.domain && <Button variant="plain" loading={busy === 'reset'} onClick={async () => {
+            if (await confirmDialog({ title: 'Вернуться к доступу по IP?', text: 'Порты 80/443 панели будут закрыты, интерфейс вернётся к собственному сертификату.', confirm: 'Сбросить', danger: true })) run('reset', async () => { await api.post('/api/system/domain/reset'); setDomain(''); reload(true); }, 'Домен отключён');
+          }}>Отключить домен</Button>}
+          <Button variant="primary" loading={busy === 'apply' || cert?.running} disabled={!domain.trim() || (!data.acme_email && !email.trim())} onClick={apply}>
+            {data.domain ? 'Применить и перевыпустить' : 'Подключить домен'}
+          </Button>
         </div>
       </div>
     </div>

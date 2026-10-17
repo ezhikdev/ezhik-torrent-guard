@@ -23,7 +23,8 @@ import uuid
 from collections import deque
 
 from . import (
-    __version__, certs, legacy, logguard, paths, suricata, system, units, updater,
+    __version__, certs, firewall, legacy, logguard, netopt, nginx, paths, ports, site, suricata, system, units,
+    updater,
 )
 from .client import PanelClient, PanelError
 from .detector import Detector, DetectorConfig
@@ -63,6 +64,9 @@ class Agent:
         self.sync_error = None
         self.exit_code = 0
         self.uninstalling = False
+        self.firewall = firewall.Firewall(self.panel_reachable)
+        self.nginx = nginx.NginxManager()
+        self.ports_cache = (0, None)
         self._load_outbox()
 
     # ---------------------------------------------------------- persistence
@@ -174,6 +178,11 @@ class Agent:
                 "update": self.state.get("update"),
                 "legacy": self.state.get("legacy"),
                 "outbox": len(self.outbox),
+                "ports": self.services_snapshot(),
+                "nginx": {"mode": ((self.desired or {}).get("nginx") or {}).get("mode", "direct"), **self.nginx.last},
+                "firewall": {"active": firewall.current() is not None, **self.firewall.counters()},
+                "bbr": netopt.status(),
+                "site": {"version": site.installed_version()},
                 "acks": list(self.pending_acks),
                 "wait": SYNC_WAIT,
             }
@@ -295,6 +304,11 @@ class Agent:
         self.step("suricata", lambda: self.reconcile_suricata(desired))
         self.step("detector", lambda: self.reconcile_detector(desired))
         self.step("certificate", lambda: self.reconcile_cert(desired))
+        self.step("site", lambda: self.reconcile_site(desired))
+        self.step("nginx", lambda: self.reconcile_nginx(desired))
+        self.step("bbr", lambda: netopt.apply(desired["bbr"]) if desired.get("bbr") is not None else None)
+        self.step("firewall", lambda: self.firewall.apply(desired.get("firewall"), self.state))
+        self.save_state()
         self.step("agent_update", lambda: self.reconcile_update(desired))
         if triggered:
             with self.lock:
@@ -423,6 +437,49 @@ class Agent:
         self.save_state()
         return f"installed v{cert['version']}"
 
+    def panel_reachable(self):
+        try:
+            self.client.request("GET", "/agent/v1/ping", timeout=8)
+            return True
+        except Exception as exc:
+            log.warning("Panel check failed: %s", short_error(exc, 120))
+            return False
+
+    def reconcile_site(self, desired):
+        if ((desired.get("nginx") or {}).get("mode") or "direct") != "frontend":
+            return None
+        wanted = desired.get("site")
+        if not wanted:
+            site.use_builtin()
+            self.state["site"] = {"version": "builtin"}
+            return "встроенная заглушка"
+        if site.installed_version() == wanted["version"]:
+            return f"{wanted.get('name') or 'сайт'} v{wanted['version']}"
+        archive = paths.DOWNLOAD_DIR / "site.tar.gz"
+        self.client.download(wanted["url"], archive, wanted["sha256"], timeout=300)
+        try:
+            site.install(archive, wanted["version"])
+        finally:
+            archive.unlink(missing_ok=True)
+        self.state["site"] = {"version": wanted["version"], "installed_at": time.time()}
+        return f"{wanted.get('name') or 'сайт'} v{wanted['version']} установлен"
+
+    def reconcile_nginx(self, desired):
+        cfg = desired.get("nginx") or {"mode": "direct"}
+        network = nginx.container_network(self.detector.config.container or "remnanode")
+        return self.nginx.apply(cfg, desired.get("cert_target") or {}, network, self.state)
+
+    def services_snapshot(self):
+        at, cached = self.ports_cache
+        if cached is None or time.time() - at > 60:
+            try:
+                cached = {"services": ports.services(), "ssh": ports.ssh_ports(), "panel_ports": panel_ports(),
+                          "container_network": nginx.container_network(self.detector.config.container or "remnanode")}
+            except Exception as exc:
+                cached = {"error": short_error(exc)}
+            self.ports_cache = (time.time(), cached)
+        return cached
+
     def reconcile_update(self, desired):
         wanted = (desired.get("agent") or {})
         version = wanted.get("version")
@@ -532,6 +589,22 @@ class Agent:
         uninstall_detached()
         self.exit_code = 0
         self.stop_event.set()
+
+
+def panel_ports():
+    """Ports of an Ezhik Guard panel installed on this same host (never firewalled)."""
+    found = []
+    try:
+        for line in paths.p("/etc/ezhik-guard/panel/panel.env").read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition("=")
+            if key in ("EZHIK_WEB_PORT", "EZHIK_AGENT_PORT", "EZHIK_HTTP_PORT", "EZHIK_HTTPS_PORT") and value.strip().isdigit():
+                found.append(int(value.strip()))
+    except OSError:
+        pass
+    # Extra listeners enabled from the UI (domain on 443, ACME on 80).
+    extra = read_json(paths.p("/var/lib/ezhik-guard/panel/listeners.json"), {}) or {}
+    found += [p for p in extra.get("ports") or [] if isinstance(p, int)]
+    return sorted(set(found))
 
 
 # ------------------------------------------------------------------ CLI

@@ -14,6 +14,8 @@ import time
 
 from . import __version__, config as config_mod, security
 from .certificates import CertificateService
+from .panel_domain import Listeners
+from .sites import SiteService
 from .db import Database
 from .events import EventService
 from .nodes import NodeService
@@ -44,18 +46,37 @@ class Context:
         self.certs = CertificateService(self.db, self.settings, self.secrets, self.events, cfg,
                                         on_change=self._cert_changed)
         self.nodes = NodeService(self.db, self.settings, self.events, self.releases, self.certs, self.pki, cfg)
-        self.web_ssl = None
+        self.ssl_contexts = []
+        self.admin_app = None
+        self.listeners = Listeners(self)
+        self.certs.http_listener_ready = self.listeners.http_ready
+        key_path = cfg.data_dir / "preview.key"
+        if not key_path.exists():
+            key_path.write_bytes(secrets.token_bytes(32))
+            os.chmod(key_path, 0o600)
+        self.sites = SiteService(self.db, cfg, key_path.read_bytes())
+        self.remnawave_cache = {}
+        self.nodes.sites = self.sites
+        self.nodes.remnawave_cache = self.remnawave_cache
         self.settings.listeners.append(self._settings_changed)
         self._stop = threading.Event()
 
     def _cert_changed(self, cert_id):
         for row in self.db.all("SELECT id FROM nodes WHERE cert_id=?", (cert_id,)):
             self.nodes.wake(row["id"])
+        panel = self.settings.panel()
+        if panel.get("domain_cert_id") == cert_id and panel.get("web_cert_id") != cert_id:
+            # The domain certificate was issued: switch the UI to it automatically.
+            self.settings.set_panel({"web_cert_id": cert_id}, "system")
+            self.events.record_system("system", f"Панель доступна по https://{panel.get('domain')}")
         if self.settings.panel().get("web_cert_id") == cert_id:
             self.apply_web_certificate()
 
     def _settings_changed(self, section):
+        if section in ("firewall", "network"):
+            self.nodes.wake()
         if section == "panel":
+            self.listeners.request_reconcile()
             names = [n for n in {self.config.public_host, self.settings.panel().get("public_host")} if n]
             self.pki.ensure(names)
 
@@ -68,15 +89,15 @@ class Context:
         return str(self.pki.server_cert_path), str(self.pki.server_key_path)
 
     def apply_web_certificate(self):
-        """Hot-swap the UI certificate for new TLS handshakes."""
-        if self.web_ssl is None:
-            return
+        """Hot-swap the UI certificate for new TLS handshakes on all UI ports."""
         cert, key = self.web_cert_files()
-        try:
-            self.web_ssl.load_cert_chain(cert, key)
-            log.info("Web UI certificate loaded from %s", cert)
-        except (OSError, ssl.SSLError) as exc:
-            log.error("Cannot load web certificate: %s", exc)
+        for context in list(self.ssl_contexts):
+            try:
+                context.load_cert_chain(cert, key)
+            except (OSError, ssl.SSLError) as exc:
+                log.error("Cannot load web certificate: %s", exc)
+                return
+        log.info("Web UI certificate loaded from %s", cert)
 
     # ------------------------------------------------------------ jobs
 
@@ -86,8 +107,28 @@ class Context:
         threading.Thread(target=self._jobs, name="jobs", daemon=True).start()
         threading.Thread(target=self.releases.agent_bundle, daemon=True).start()
 
+    def refresh_remnawave(self):
+        """Background cache of Remnawave nodes/inbounds and its IPs (firewall whitelist)."""
+        from .firewall import resolve_host
+
+        url = self.settings.remnawave().get("url")
+        if url:
+            resolve_host(url)
+        client = self.sanctions.client()
+        if not client.configured:
+            return
+        try:
+            before = self.remnawave_cache.get("nodes")
+            self.remnawave_cache["nodes"] = client.nodes(max_age=0)
+            self.remnawave_cache["at"] = time.time()
+            self.remnawave_cache.pop("error", None)
+            if before != self.remnawave_cache["nodes"]:
+                self.nodes.wake()
+        except Exception as exc:
+            self.remnawave_cache["error"] = str(exc)[:200]
+
     def _jobs(self):
-        last = {"monitor": 0, "certs": 0, "cleanup": 0, "updates": 0}
+        last = {"monitor": 0, "certs": 0, "cleanup": 0, "updates": 0, "remnawave": 0}
         while not self._stop.wait(5):
             now = time.time()
             try:
@@ -101,6 +142,9 @@ class Context:
                     self.events.cleanup()
                     self.db.execute("DELETE FROM login_attempts WHERE at<?", (now - 86400,))
                     last["cleanup"] = now
+                if now - last["remnawave"] >= 120:
+                    last["remnawave"] = now
+                    self.refresh_remnawave()
                 if now - last["updates"] >= 6 * 3600:
                     self.releases.check_latest(force=True)
                     last["updates"] = now
@@ -115,6 +159,7 @@ async def serve(ctx):
 
     cfg = ctx.config
     admin_app = build_admin_app(ctx)
+    ctx.admin_app = admin_app
     agent_app = build_agent_app(ctx)
     web_kwargs = {}
     if cfg.web_tls:
@@ -147,7 +192,10 @@ async def serve(ctx):
     async def capture_ssl():
         while not web.started:
             await asyncio.sleep(0.2)
-        ctx.web_ssl = web.config.ssl
+        if web.config.ssl:
+            ctx.ssl_contexts.append(web.config.ssl)
+        ctx.listeners.bind(asyncio.get_running_loop())
+        await ctx.listeners.reconcile()
 
     log.info("Ezhik Guard panel %s: UI %s://%s:%s, agents https://%s:%s", __version__,
              "https" if cfg.web_tls else "http", cfg.web_host, cfg.web_port, cfg.agent_host, cfg.agent_port)

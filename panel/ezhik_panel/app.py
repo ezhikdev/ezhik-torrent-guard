@@ -7,16 +7,22 @@ import time
 import zipfile
 from pathlib import Path
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+import mimetypes
+
+from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from . import __version__, security
 from .certificates import CertError, analyze, covers, normalize_domains, provider_public
 from .dns_providers import AcmeDnsProvider, CloudflareProvider, DnsError
 from .nodes import NodeError
+from . import nginx_routes, panel_domain
+from .certificates import HTTP01, normalize_domain
+from .firewall import FirewallError, resolve_host
 from .remnawave import Remnawave
 from .settings_service import ValidationError
+from .sites import DEFAULT_PREVIEW_HTML, SiteError, rewrite
 
 log = logging.getLogger("ezhik.app")
 
@@ -56,7 +62,7 @@ def _error_handlers(app):
     async def not_found(_request, exc):
         return JSONResponse({"detail": str(exc).strip("'") or "Не найдено"}, status_code=404)
 
-    for cls in (NodeError, CertError, ValidationError, DnsError):
+    for cls in (NodeError, CertError, ValidationError, DnsError, SiteError, FirewallError, nginx_routes.RouteError):
         @app.exception_handler(cls)
         async def invalid(_request, exc):
             return JSONResponse({"detail": str(exc)}, status_code=400)
@@ -403,7 +409,8 @@ def build_admin_app(ctx):
 
     @app.put("/api/settings/panel")
     def put_panel(body: dict = Body(...), who=Depends(actor)):
-        allowed = {k: body[k] for k in ("public_host", "web_cert_id", "timezone") if k in body}
+        allowed = {k: body[k] for k in ("public_host", "web_cert_id", "timezone", "http_port", "https_port")
+                   if k in body}
         if allowed.get("web_cert_id"):
             cert = ctx.certs.get(allowed["web_cert_id"])
             if not cert["version"]:
@@ -568,6 +575,259 @@ def build_admin_app(ctx):
                 pass
         return rows
 
+    # ------------------------------------------------------ firewall/network
+
+    @app.get("/api/settings/firewall")
+    def get_firewall(_=Depends(current_session)):
+        rw = ctx.settings.remnawave()
+        return {"firewall": ctx.settings.firewall(), "network": ctx.settings.network(),
+                "remnawave_ips": resolve_host(rw.get("url"), cached_only=True),
+                "remnawave_cache": {"at": ctx.remnawave_cache.get("at"), "error": ctx.remnawave_cache.get("error"),
+                                    "nodes": len(ctx.remnawave_cache.get("nodes") or [])}}
+
+    @app.put("/api/settings/firewall")
+    def put_firewall(body: dict = Body(...), who=Depends(actor)):
+        return ctx.settings.set_firewall(body, who)
+
+    @app.put("/api/settings/network")
+    def put_network(body: dict = Body(...), who=Depends(actor)):
+        return ctx.settings.set_network(body, who)
+
+    @app.post("/api/remnawave/refresh")
+    def refresh_remnawave(_=Depends(actor)):
+        ctx.refresh_remnawave()
+        return {"nodes": len(ctx.remnawave_cache.get("nodes") or []), "error": ctx.remnawave_cache.get("error")}
+
+    @app.post("/api/nodes/{node_id}/nginx/remnawave-sync")
+    def remnawave_sync(node_id: str, body: dict = Body(...), who=Depends(actor)):
+        """Adjust ONE inbound of the node's Remnawave profile to match a route.
+        Without confirm=true only a before/after preview is returned."""
+        node = ctx.nodes.get(node_id)
+        cfg_nginx = nginx_routes.node_config(node)
+        route = next((r for r in cfg_nginx["routes"] if r["id"] == body.get("route_id")), None)
+        if not route:
+            raise HTTPException(404, "Маршрут не найден")
+        rw_node = ctx.nodes.remnawave_node(node)
+        if not rw_node:
+            raise HTTPException(400, "Нода не сопоставлена с Remnawave")
+        profile_uuid = (rw_node.get("configProfile") or {}).get("activeConfigProfileUuid")
+        tag = body.get("inbound_tag") or next((c["inbound"] for c in nginx_routes.check_routes(cfg_nginx, rw_node)
+                                              if c["route_id"] == route["id"]), None)
+        if not profile_uuid or not tag:
+            raise HTTPException(400, "Не найден профиль или inbound для синхронизации")
+        client = ctx.sanctions.client()
+        profile = client.config_profile(profile_uuid)
+        config = profile.get("config") or {}
+        try:
+            new = nginx_routes.patch_profile(config, tag, route)
+        except nginx_routes.RouteError as exc:
+            raise HTTPException(400, str(exc))
+        shared = [n.get("name") for n in (ctx.remnawave_cache.get("nodes") or [])
+                  if (n.get("configProfile") or {}).get("activeConfigProfileUuid") == profile_uuid]
+        if not body.get("confirm"):
+            before = next(i for i in config.get("inbounds", []) if i.get("tag") == tag)
+            after = next(i for i in new.get("inbounds", []) if i.get("tag") == tag)
+            return {"preview": True, "profile": profile.get("name"), "inbound": tag, "shared_with": shared,
+                    "before": before, "after": after}
+        client.update_config_profile(profile_uuid, new)
+        db.audit(who, "remnawave.profile_inbound_sync", profile_uuid, {"inbound": tag, "node": node_id})
+        ctx.refresh_remnawave()
+        return {"ok": True, "profile": profile.get("name"), "inbound": tag}
+
+    # ------------------------------------------------------------- sites
+
+    @app.get("/api/sites")
+    def list_sites(_=Depends(current_session)):
+        sites = ctx.sites.list()
+        default = next((x for x in sites if x["is_default"]), None)
+        status = []
+        for node in ctx.nodes.list():
+            if node["nginx"]["mode"] != "frontend":
+                continue
+            site_row, version = ctx.sites.effective_for({"site_id": node["site_id"]})
+            status.append({"id": node["id"], "name": node["name"], "online": node["online"],
+                           "site": site_row["name"] if site_row else "встроенная", "wanted": version or "builtin",
+                           "installed": (node["site_state"] or {}).get("version")})
+        return {"sites": sites, "default": default["id"] if default else None, "nodes": status}
+
+    @app.post("/api/sites/upload")
+    async def upload_site(file: UploadFile = File(...), name: str = Form(""), site_id: str = Form(""),
+                          note: str = Form(""), who=Depends(actor)):
+        data = await file.read(160 << 20)
+        if len(data) >= 160 << 20:
+            raise HTTPException(413, "ZIP больше 160 МБ")
+        return ctx.sites.upload(data, name or (file.filename or "Сайт").rsplit(".", 1)[0], site_id or None, note, who)
+
+    @app.patch("/api/sites/{site_id}")
+    def patch_site(site_id: str, body: dict = Body(...), who=Depends(actor)):
+        ctx.sites.update(site_id, body.get("name"), body.get("is_default"), who)
+        ctx.nodes.wake()
+        return ctx.sites.get(site_id)
+
+    @app.post("/api/sites/{site_id}/publish")
+    def publish_site(site_id: str, body: dict = Body(...), who=Depends(actor)):
+        ctx.sites.publish(site_id, str(body.get("version")), who)
+        ctx.nodes.wake()
+        return ctx.sites.get(site_id)
+
+    @app.delete("/api/sites/{site_id}")
+    def delete_site(site_id: str, who=Depends(actor)):
+        ctx.sites.delete(site_id, who)
+        ctx.nodes.wake()
+        return {"ok": True}
+
+    @app.delete("/api/sites/{site_id}/versions/{version}")
+    def delete_site_version(site_id: str, version: str, who=Depends(actor)):
+        ctx.sites.delete_version(site_id, version, who)
+        return {"ok": True}
+
+    @app.get("/api/sites/{site_id}/preview")
+    def site_preview(site_id: str, version: str = "", _=Depends(current_session)):
+        site = ctx.sites.get(site_id)
+        version = version or site["draft_version"] or site["current_version"]
+        if not version:
+            raise HTTPException(404, "У сайта нет версий")
+        return {"url": f"/site-mask/{ctx.sites.preview_token(site_id, version)}/", "version": version}
+
+    @app.get("/api/nodes/{node_id}/site-preview")
+    def node_site_preview(node_id: str, _=Depends(current_session)):
+        site, version = ctx.sites.effective_for(ctx.nodes.get(node_id))
+        if not site:
+            return {"url": "/site-mask/builtin/", "version": "builtin"}
+        return {"url": f"/site-mask/{ctx.sites.preview_token(site['id'], version)}/", "version": version}
+
+    preview_headers = {
+        # Uploaded JavaScript runs in an opaque origin: no access to the admin
+        # session, cookies or panel API, even though the URL is on the panel.
+        "Content-Security-Policy": "sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads; "
+                                   "default-src 'self' data: blob: https: 'unsafe-inline' 'unsafe-eval'",
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "no-store",
+        "Referrer-Policy": "no-referrer",
+        # The sandboxed page has an opaque ("null") origin, so module scripts,
+        # fonts and fetch() of its own files are cross-origin requests. The
+        # files are already reachable by anyone holding the token and no
+        # credentials are allowed, so a wildcard exposes nothing new.
+        "Access-Control-Allow-Origin": "*",
+    }
+
+    @app.get("/site-mask/")
+    def site_mask_root(request: Request):
+        token = request.cookies.get(SESSION_COOKIE)
+        if not token or not db.one("SELECT 1 FROM sessions WHERE token_hash=? AND expires_at>?",
+                                   (security.token_hash(token), time.time())):
+            raise HTTPException(401, "Войдите в панель, чтобы открыть предпросмотр")
+        default = ctx.sites.default()
+        if not default or not default["current_version"]:
+            return RedirectResponse("/site-mask/builtin/")
+        return RedirectResponse(f"/site-mask/{ctx.sites.preview_token(default['id'], default['current_version'])}/")
+
+    @app.get("/site-mask/{token}/{path:path}")
+    def site_mask(token: str, path: str):
+        if token == "builtin":
+            return Response(DEFAULT_PREVIEW_HTML, media_type="text/html", headers=preview_headers)
+        directory = ctx.sites.resolve_token(token)
+        if directory is None:
+            raise HTTPException(404, "Ссылка предпросмотра устарела — откройте её заново из панели")
+        prefix = f"/site-mask/{token}"
+        root = directory.resolve()
+        candidates = [path, path.rstrip("/") + "/index.html", path + ".html"] if path else ["index.html"]
+        target, status = None, 200
+        for candidate in candidates:
+            item = (root / candidate).resolve()
+            if (item == root or root in item.parents) and item.is_file():
+                target = item
+                break
+        if target is None:
+            fallback = root / "404.html"
+            target, status = (fallback, 404) if fallback.exists() else (root / "index.html", 200)
+        kind = target.suffix.lower()
+        if kind in (".html", ".htm"):
+            return Response(rewrite(target.read_bytes(), "html", prefix), status_code=status,
+                            media_type="text/html; charset=utf-8", headers=preview_headers)
+        if kind == ".css":
+            return Response(rewrite(target.read_bytes(), "css", prefix), media_type="text/css; charset=utf-8",
+                            headers=preview_headers)
+        if kind in (".js", ".mjs"):
+            return Response(rewrite(target.read_bytes(), "js", prefix), media_type="text/javascript; charset=utf-8",
+                            headers=preview_headers)
+        media = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        return FileResponse(target, media_type=media, headers=preview_headers)
+
+    # ------------------------------------------------------------ domain
+
+    @app.get("/api/system/domain")
+    def domain_status(_=Depends(current_session)):
+        panel = ctx.settings.panel()
+        cert = None
+        if panel.get("domain_cert_id"):
+            try:
+                cert = ctx.certs.get(panel["domain_cert_id"])
+            except LookupError:
+                cert = None
+        return {"domain": panel.get("domain"), "http_port": panel.get("http_port"), "https_port": panel.get("https_port"),
+                "web_port": cfg.web_port, "certificate": cert, "listeners": ctx.listeners.status(),
+                "acme_email": ctx.settings.acme().get("email"),
+                "active": bool(cert and cert["version"] and panel.get("web_cert_id") == cert["id"])}
+
+    @app.post("/api/system/domain/check")
+    def domain_check(body: dict = Body(...), _=Depends(actor)):
+        domain = normalize_domain(str(body.get("domain") or ""))
+        if domain.startswith("*."):
+            raise HTTPException(400, "Для панели нужен обычный домен, не wildcard")
+        return panel_domain.check(domain, cfg, ctx.settings.panel(), ctx.certs.http_challenges)
+
+    @app.post("/api/system/domain/apply")
+    def domain_apply(body: dict = Body(...), who=Depends(actor)):
+        domain = normalize_domain(str(body.get("domain") or ""))
+        if domain.startswith("*."):
+            raise HTTPException(400, "Для панели нужен обычный домен, не wildcard")
+        challenge = body.get("challenge") or HTTP01
+        http_port = 80 if (challenge == HTTP01 or body.get("redirect_http")) else 0
+        https_port = 443 if body.get("listen_443") else 0
+        if not ctx.settings.acme().get("email"):
+            email = str(body.get("email") or "").strip()
+            if not email:
+                raise HTTPException(400, "Укажите e-mail для Let's Encrypt")
+            ctx.settings.set_acme({"email": email}, who)
+        panel = ctx.settings.set_panel({"domain": domain, "http_port": http_port, "https_port": https_port}, who)
+        ctx.listeners.request_reconcile()
+        for _ in range(30):
+            time.sleep(0.2)
+            if not http_port or ctx.listeners.http_ready():
+                break
+        if challenge == HTTP01 and not ctx.listeners.http_ready():
+            raise HTTPException(400, "Панель не смогла занять порт 80: "
+                                + str(ctx.listeners.status()["errors"].get(80, "порт занят"))
+                                + ". Освободите его или выберите DNS-провайдера.")
+        cert = None
+        if panel.get("domain_cert_id"):
+            try:
+                cert = ctx.certs.get(panel["domain_cert_id"])
+                if cert["domains"] != [domain] or cert["source"] != "acme":
+                    cert = None
+            except LookupError:
+                cert = None
+        if cert:
+            db.execute("UPDATE certificates SET provider_id=?, challenge=NULL, next_attempt_at=NULL WHERE id=?",
+                       (challenge, cert["id"]))
+            ctx.certs.start_issue(cert["id"])
+        else:
+            cert = ctx.certs.create(f"Панель {domain}", [domain], challenge, "ec256", True, who)
+            ctx.settings.set_panel({"domain_cert_id": cert["id"]}, who)
+        if body.get("agents_use_domain"):
+            ctx.settings.set_panel({"public_host": domain}, who)
+        db.audit(who, "panel.domain", domain, {"challenge": challenge, "https_port": https_port})
+        return {"ok": True, "certificate_id": cert["id"]}
+
+    @app.post("/api/system/domain/reset")
+    def domain_reset(who=Depends(actor)):
+        ctx.settings.set_panel({"domain": "", "http_port": 0, "https_port": 0, "web_cert_id": None,
+                                "domain_cert_id": None}, who)
+        ctx.apply_web_certificate()
+        ctx.listeners.request_reconcile()
+        return {"ok": True}
+
     # ----------------------------------------------------------------- SPA
 
     web_dir = cfg.web_dir
@@ -673,6 +933,19 @@ def build_agent_app(ctx):
                                  f"удаляется; перенесено санкций: {adopted}", "warn", node_id=node["id"],
                                  data={"detected": body.get("detected"), "adopted": adopted})
         return {"adopted": adopted}
+
+    @app.get("/agent/v1/ping")
+    def ping(request: Request):
+        node_auth(request)
+        return {"ok": True, "time": time.time()}
+
+    @app.get("/agent/v1/site/{site_id}/{name}")
+    def site_bundle(site_id: str, name: str, request: Request):
+        node = node_auth(request)
+        site, version = ctx.sites.effective_for(node)
+        if not site or site["id"] != site_id or name != f"{version}.tar.gz":
+            raise HTTPException(404, "site not assigned to this node")
+        return FileResponse(ctx.sites.bundle_path(site_id, version), media_type="application/gzip")
 
     @app.get("/agent/v1/certificate")
     def certificate(request: Request):

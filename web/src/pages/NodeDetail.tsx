@@ -9,6 +9,7 @@ import {
 } from '../components/ui';
 import { ago, bits, bytes, dateTime, dayMonth, timeShort, uptime } from '../format';
 import { navigate, toast, useRoute } from '../state';
+import { FirewallCard, NetworkSiteCard, NginxCard } from './NodeNetwork';
 import { nodeState } from './Nodes';
 
 const COMPONENT_LABEL: Record<string, string> = {
@@ -158,7 +159,7 @@ function CertCard({ node, onSaved }: { node: any; onSaved: () => void }) {
 function SettingsModal({ node, onClose, onSaved }: { node: any; onClose: () => void; onSaved: () => void }) {
   const [form, setForm] = useState({
     name: node.name, tags: (node.tags || []).join(', '), notes: node.notes || '', container: node.container_override ?? '',
-    interface: node.interface || '', wan_ip: node.wan_ip || '',
+    interface: node.interface || '', wan_ip: node.wan_ip || '', remnawave_node: node.remnawave_node_hint || '',
   });
   const { busy, run } = useAction();
   const set = (k: string) => (e: any) => setForm({ ...form, [k]: e.currentTarget.value });
@@ -170,6 +171,7 @@ function SettingsModal({ node, onClose, onSaved }: { node: any; onClose: () => v
         <Field label="Контейнер RemnaNode" hint="Пусто — автоопределение"><input class="input input--mono" value={form.container} placeholder={node.container} onInput={set('container')} /></Field>
         <Field label="WAN-интерфейс" hint="Пусто — по маршруту по умолчанию"><input class="input input--mono" value={form.interface} placeholder={node.facts?.wan_interface} onInput={set('interface')} /></Field>
         <Field label="Исходящий IPv4" hint="Если у сервера несколько адресов"><input class="input input--mono" value={form.wan_ip} placeholder={node.facts?.wan_ip} onInput={set('wan_ip')} /></Field>
+        <Field label="Нода в Remnawave" hint={node.remnawave ? `Сопоставлена: ${node.remnawave.name}` : 'UUID или адрес. Пусто — по IP/домену'}><input class="input input--mono" value={form.remnawave_node} onInput={set('remnawave_node')} /></Field>
         <Field label="Заметки"><input class="input" value={form.notes} onInput={set('notes')} /></Field>
       </div>
       <div class="form-actions">
@@ -371,6 +373,13 @@ export function NodeDetail({ id }: { id: string }) {
 
       {n.status !== 'pending' && <MetricsCard id={id} />}
       {n.status !== 'pending' && <CertCard node={n} onSaved={() => reload(true)} />}
+      {n.status !== 'pending' && <NginxCard node={n} onSaved={() => reload(true)} />}
+      {n.status !== 'pending' && (
+        <div class="grid grid--2-1">
+          <FirewallCard node={n} onSaved={() => reload(true)} />
+          <NetworkSiteCard node={n} onSaved={() => reload(true)} />
+        </div>
+      )}
 
       <div class="card card--flush">
         <div class="card-head" style={{ padding: '18px 20px 6px' }}><div class="card-title">События ноды</div></div>

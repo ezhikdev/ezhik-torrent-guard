@@ -41,6 +41,12 @@ class Remnawave:
             "Accept": "application/json",
             "User-Agent": f"Ezhik-Guard/{__version__}",
         }
+        if self.base_url.startswith("http://"):
+            # Remnawave drops connections that did not come through an HTTPS
+            # reverse proxy; a direct local URL (http://127.0.0.1:3000) needs
+            # these headers, exactly as its docs recommend for local access.
+            headers["X-Forwarded-For"] = "127.0.0.1"
+            headers["X-Forwarded-Proto"] = "https"
         if method == "POST" and body is None:
             data = b""
         if body is not None:
@@ -129,6 +135,49 @@ class Remnawave:
 
     def enable(self, user):
         return self.request("POST", self._action_path(user, "enable"))
+
+    # ------------------------------------------------------- nodes/profiles
+
+    def nodes(self, max_age=60):
+        """Remnawave nodes with address, API port and active inbounds (cached)."""
+        cached = getattr(self, "_nodes_cache", None)
+        if cached and time.time() - cached[0] < max_age:
+            return cached[1]
+        code, payload = self.request("GET", "/api/nodes")
+        data = payload.get("response") if isinstance(payload, dict) else None
+        if code != 200 or not isinstance(data, list):
+            raise RuntimeError(f"Remnawave /api/nodes: HTTP {code}")
+        self._nodes_cache = (time.time(), data)
+        return data
+
+    def match_node(self, addresses, uuid_hint=None):
+        try:
+            nodes = self.nodes()
+        except Exception:
+            return None
+        for node in nodes:
+            if uuid_hint and node.get("uuid") == uuid_hint:
+                return node
+        wanted = {a for a in addresses if a}
+        for node in nodes:
+            if str(node.get("address") or "").strip() in wanted:
+                return node
+        return None
+
+    def config_profile(self, profile_uuid):
+        code, payload = self.request("GET", f"/api/config-profiles/{profile_uuid}")
+        data = payload.get("response") if isinstance(payload, dict) else None
+        if code != 200 or not isinstance(data, dict):
+            raise RuntimeError(f"Remnawave config profile: HTTP {code}")
+        return data
+
+    def update_config_profile(self, profile_uuid, config):
+        code, payload = self.request("PATCH", "/api/config-profiles", {"uuid": profile_uuid, "config": config})
+        if code != 200:
+            raise RuntimeError(f"Remnawave отклонил изменение профиля: HTTP {code} {find_error_code(payload) or ''}"
+                               f" {str(payload.get('message', ''))[:200]}")
+        self._nodes_cache = None
+        return payload.get("response")
 
     def check(self):
         """Connection test for the settings page."""

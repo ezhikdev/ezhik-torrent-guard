@@ -20,6 +20,7 @@ from .db import loads
 
 log = logging.getLogger("ezhik.certs")
 
+HTTP01 = "http01"
 LABEL_RE = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$")
 
 
@@ -141,6 +142,8 @@ class CertificateService:
         self.acme_verify = os.environ.get("EZHIK_ACME_CA_BUNDLE") or True
         self.propagation = dns_providers.Propagation(config.dns_resolvers, os.environ.get("EZHIK_DNS_PORT", "53"))
         self.propagation_timeout = int(os.environ.get("EZHIK_DNS_PROPAGATION_TIMEOUT", "600"))
+        self.http_challenges = {}                 # token -> key authorization (served on port 80)
+        self.http_listener_ready = lambda: False  # set by the panel when its port-80 listener runs
 
     # ------------------------------------------------------------ queries
 
@@ -156,8 +159,11 @@ class CertificateService:
         row["challenge"] = loads(row["challenge"], None)
         row["nodes"] = self.db.all("SELECT id, name, domain FROM nodes WHERE cert_id=? ORDER BY name", (row["id"],))
         row["running"] = row["id"] in self.running
-        provider = self.db.one("SELECT * FROM dns_providers WHERE id=?", (row["provider_id"],)) if row["provider_id"] else None
-        row["provider"] = provider_public(provider, self.secrets) if provider else None
+        if row["provider_id"] == HTTP01:
+            row["provider"] = {"id": HTTP01, "name": "HTTP-01 (порт 80 панели)", "type": HTTP01}
+        else:
+            provider = self.db.one("SELECT * FROM dns_providers WHERE id=?", (row["provider_id"],)) if row["provider_id"] else None
+            row["provider"] = provider_public(provider, self.secrets) if provider else None
         return row
 
     def list(self):
@@ -174,7 +180,10 @@ class CertificateService:
         if key_type not in ("ec256", "ec384", "rsa2048", "rsa4096"):
             raise CertError("Неизвестный тип ключа")
         provider = None
-        if provider_id:
+        if provider_id == HTTP01:
+            if any(d.startswith("*.") for d in domains):
+                raise CertError("Wildcard-сертификат выпускается только через DNS-01 (Cloudflare, acme-dns или вручную)")
+        elif provider_id:
             provider = self.db.one("SELECT * FROM dns_providers WHERE id=?", (provider_id,))
             if not provider:
                 raise CertError("DNS-провайдер не найден")
@@ -301,6 +310,8 @@ class CertificateService:
         if not row or row["source"] != "acme":
             return
         domains = loads(row["domains"], [])
+        if row["provider_id"] == HTTP01:
+            return self._issue_http01(cert_id, row, domains)
         provider_row = self.db.one("SELECT * FROM dns_providers WHERE id=?", (row["provider_id"],)) if row["provider_id"] else None
         provider = dns_providers.build(provider_row, self.secrets)
         manual_state = loads(row["challenge"], {}) or {}
@@ -357,27 +368,57 @@ class CertificateService:
                         for name, values in group:
                             provider.cleanup(name, values)
 
-            self._progress(cert_id, "finalizing")
-            key = acme_mod.generate_key(row["key_type"])
-            fullchain = client.finalize(order, acme_mod.make_csr(key, domains))
-            privkey = acme_mod.key_pem(key)
-            info = parse_certificate(fullchain)
-            missing = [d for d in domains if d not in info["names"]]
-            if missing or not key_matches(info, privkey):
-                raise CertError("Выпущенный сертификат не соответствует запросу: " + ", ".join(missing))
-            self._store(cert_id, fullchain, privkey)
-            self.db.execute(
-                "UPDATE certificates SET status='valid', version=version+1, issued_at=?, not_before=?, not_after=?, "
-                "fingerprint=?, issuer=?, last_error=NULL, next_attempt_at=NULL, challenge=NULL, updated_at=? WHERE id=?",
-                (time.time(), info["not_before"], info["not_after"], info["fingerprint"], info["issuer"],
-                 time.time(), cert_id),
-            )
-            self.events.record_system("cert", f"Сертификат {row['name']} выпущен до "
-                                      + time.strftime("%d.%m.%Y", time.localtime(info["not_after"])),
-                                      data={"cert_id": cert_id, "domains": domains})
-            log.info("Certificate %s issued for %s", cert_id, ", ".join(domains))
-            self.on_change(cert_id)
+            self._finalize(cert_id, row, domains, client, order)
         finally:
+            client.close()
+
+    def _finalize(self, cert_id, row, domains, client, order):
+        self._progress(cert_id, "finalizing")
+        key = acme_mod.generate_key(row["key_type"])
+        fullchain = client.finalize(order, acme_mod.make_csr(key, domains))
+        privkey = acme_mod.key_pem(key)
+        info = parse_certificate(fullchain)
+        missing = [d for d in domains if d not in info["names"]]
+        if missing or not key_matches(info, privkey):
+            raise CertError("Выпущенный сертификат не соответствует запросу: " + ", ".join(missing))
+        self._store(cert_id, fullchain, privkey)
+        self.db.execute(
+            "UPDATE certificates SET status='valid', version=version+1, issued_at=?, not_before=?, not_after=?, "
+            "fingerprint=?, issuer=?, last_error=NULL, next_attempt_at=NULL, challenge=NULL, updated_at=? WHERE id=?",
+            (time.time(), info["not_before"], info["not_after"], info["fingerprint"], info["issuer"],
+             time.time(), cert_id),
+        )
+        self.events.record_system("cert", f"Сертификат {row['name']} выпущен до "
+                                  + time.strftime("%d.%m.%Y", time.localtime(info["not_after"])),
+                                  data={"cert_id": cert_id, "domains": domains})
+        log.info("Certificate %s issued for %s", cert_id, ", ".join(domains))
+        self.on_change(cert_id)
+
+    def _issue_http01(self, cert_id, row, domains):
+        """HTTP-01: the panel's own port-80 listener answers the CA."""
+        if not self.http_listener_ready():
+            raise CertError("HTTP-01 требует, чтобы панель слушала порт 80 (Настройки → Панель → домен)")
+        client = self._client()
+        tokens = []
+        try:
+            self._set(cert_id, status="issuing", last_attempt_at=time.time(), last_error=None)
+            self._progress(cert_id, "account")
+            self._account(client)
+            self._progress(cert_id, "order")
+            order = client.new_order(domains)
+            challenges = client.challenges(order, "http-01")
+            for ch in challenges:
+                self.http_challenges[ch["token"]] = ch["key_authorization"]
+                tokens.append(ch["token"])
+            self._progress(cert_id, "validating")
+            for ch in challenges:
+                client.answer(ch["url"])
+            for ch in challenges:
+                client.wait_authz(ch["authz"])
+            self._finalize(cert_id, row, domains, client, order)
+        finally:
+            for token in tokens:
+                self.http_challenges.pop(token, None)
             client.close()
 
     def confirm_manual(self, cert_id):

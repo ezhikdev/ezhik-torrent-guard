@@ -168,8 +168,12 @@ class AcmeClient:
         order["url"] = response.headers["Location"]
         return order
 
-    def challenges(self, order):
-        """Return pending dns-01 challenges: [{identifier, name, value, url, authz}]"""
+    def challenges(self, order, kind="dns-01"):
+        """Pending challenges of one type.
+
+        dns-01:  [{identifier, name, value, url, authz}]
+        http-01: [{identifier, token, key_authorization, url, authz}]
+        """
         out = []
         thumb = self.thumbprint()
         for authz_url in order["authorizations"]:
@@ -181,17 +185,18 @@ class AcmeClient:
             identifier = authz["identifier"]["value"]
             if authz.get("wildcard"):
                 identifier = "*." + identifier
-            dns01 = next((c for c in authz["challenges"] if c["type"] == "dns-01"), None)
-            if not dns01:
-                raise AcmeError(f"no dns-01 challenge offered for {identifier}")
-            key_authorization = f"{dns01['token']}.{thumb}"
-            out.append({
-                "identifier": identifier,
-                "name": challenge_name(identifier),
-                "value": b64(hashlib.sha256(key_authorization.encode()).digest()),
-                "url": dns01["url"],
-                "authz": authz_url,
-            })
+            chosen = next((c for c in authz["challenges"] if c["type"] == kind), None)
+            if not chosen:
+                hint = " (wildcard требует DNS-01)" if authz.get("wildcard") else ""
+                raise AcmeError(f"CA не предлагает {kind} для {identifier}{hint}")
+            key_authorization = f"{chosen['token']}.{thumb}"
+            item = {"identifier": identifier, "url": chosen["url"], "authz": authz_url}
+            if kind == "dns-01":
+                item.update(name=challenge_name(identifier),
+                            value=b64(hashlib.sha256(key_authorization.encode()).digest()))
+            else:
+                item.update(token=chosen["token"], key_authorization=key_authorization)
+            out.append(item)
         return out
 
     def answer(self, challenge_url):

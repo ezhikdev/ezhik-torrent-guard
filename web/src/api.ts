@@ -11,6 +11,8 @@ export class ApiError extends Error {
 let csrf = '';
 export const session = signal<{ username: string; version: string } | null | undefined>(undefined);
 
+export const csrfToken = () => csrf;
+
 export function setCsrf(token: string) {
   csrf = token;
 }
