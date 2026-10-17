@@ -133,6 +133,14 @@ def prune_releases(keep=3):
 
 def rollback():
     """Entry point for ezhik-guard-agent-rollback.service."""
+    status = run(["systemctl", "show", "-p", "ExecMainStatus", "--value", paths.AGENT_UNIT], timeout=30)
+    if status.stdout.strip() == str(RESTART_EXIT_CODE):
+        # Deliberate restart (update activation, restart command) seen as a
+        # failure by an older unit file on systemd >= 254: start, don't roll back.
+        log.info("Agent exited with %s (deliberate restart); starting it instead of rolling back", RESTART_EXIT_CODE)
+        run(["systemctl", "reset-failed", paths.AGENT_UNIT], timeout=30)
+        run(["systemctl", "restart", paths.AGENT_UNIT], timeout=60)
+        return 0
     previous = paths.PREVIOUS_LINK
     if not previous.is_symlink():
         return 1

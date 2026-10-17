@@ -404,8 +404,12 @@ class NodeService:
         if isinstance(report, dict) and report.get("result") == "rolled-back":
             # Do not retry a release that crash-looped; the admin can retry.
             self.db.execute("UPDATE nodes SET desired_agent_version=NULL WHERE id=?", (node["id"],))
+            data = dict(report, details={"Версия": f"{report.get('from')} → {report.get('to')}"})
+            if _version_tuple(report.get("from")) < (2, 1, 2) and \
+                    (report.get("rolled_back_at") or 0) - (report.get("started_at") or 0) < 30:
+                data["detail"] = UNIT_FIX_HINT
             self.events.record_system("node", f"Обновление агента на {node['name']} откатено", "error",
-                                      node_id=node["id"], data=report)
+                                      node_id=node["id"], data=data)
 
     def pending_commands(self, node_id):
         rows = self.db.all(
@@ -662,6 +666,25 @@ class NodeService:
         self.db.execute("DELETE FROM node_uptime WHERE hour<?", (now - 35 * 86400,))
         self.db.execute("DELETE FROM install_tokens WHERE expires_at<? OR used_at<?", (now - 86400, now - 86400))
         self.db.execute("DELETE FROM node_commands WHERE created_at<?", (now - 7 * 86400,))
+
+
+# Agents before 2.1.2 install a unit without SuccessExitStatus=75; on systemd
+# >= 254 (Ubuntu 24.04) their deliberate post-update restart fires OnFailure and
+# rolls the update back within seconds. A one-time drop-in fixes it.
+UNIT_FIX_HINT = (
+    "Ubuntu 24.04 (systemd ≥ 254): старый юнит агента считает плановый перезапуск после обновления сбоем. "
+    "Выполните на ноде один раз и повторите обновление: "
+    "mkdir -p /etc/systemd/system/ezhik-guard-agent.service.d && "
+    "printf '[Service]\\nSuccessExitStatus=75\\n' > /etc/systemd/system/ezhik-guard-agent.service.d/10-restart.conf && "
+    "systemctl daemon-reload"
+)
+
+
+def _version_tuple(value):
+    try:
+        return tuple(int(x) for x in str(value).split("-")[0].split(".")[:3])
+    except ValueError:
+        return (0,)
 
 
 def _tri(value):

@@ -4,7 +4,7 @@ import shutil
 import subprocess
 import sys
 
-from . import paths, suricata
+from . import firewall, netopt, nginx, paths, site, suricata
 from .util import run
 
 UNITS = ("ezhik-guard-agent.service", "ezhik-guard-suricata.service", "ezhik-guard-agent-rollback.service")
@@ -17,6 +17,19 @@ def uninstall_now(keep_certificates=True):
         suricata.remove_all()
     except Exception as exc:  # keep going: removal must be best effort
         print(f"suricata: {exc}", file=sys.stderr)
+    # 2.1 components: hand ports 80/443 back, drop our nftables table (it would
+    # keep filtering without an agent), restore the previous TCP congestion control.
+    for name, action in (
+        ("nginx", lambda: nginx.NginxManager().apply({"mode": "direct"}, {}, None, {})),
+        ("firewall", lambda: run(["nft", "delete", "table", "inet", firewall.TABLE], timeout=30)),
+        ("bbr", lambda: netopt.apply(False)),
+        ("site", lambda: shutil.rmtree(site.ROOT, ignore_errors=True)),
+    ):
+        try:
+            action()
+        except Exception as exc:
+            print(f"{name}: {exc}", file=sys.stderr)
+    shutil.rmtree(paths.SYSTEMD_DIR / "ezhik-guard-agent.service.d", ignore_errors=True)
     for unit in UNITS:
         if unit != "ezhik-guard-agent.service":
             run(["systemctl", "disable", "--now", unit], timeout=60)

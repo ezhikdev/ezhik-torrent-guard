@@ -21,6 +21,11 @@ Environment=PYTHONPATH=/opt/ezhik-guard/agent/current
 ExecStart=/usr/bin/python3 -m ezhik_agent run
 Restart=always
 RestartSec=3
+# Exit 75 is the deliberate restart after an update or a restart command; it
+# must not count as a failure. systemd >= 254 (Ubuntu 24.04) otherwise passes
+# every auto-restart through the failed state and fires OnFailure (rollback).
+SuccessExitStatus=75
+RestartMode=direct
 KillSignal=SIGINT
 TimeoutStopSec=20
 UMask=0077
