@@ -146,7 +146,7 @@ class Remnawave:
         code, payload = self.request("GET", "/api/nodes")
         data = payload.get("response") if isinstance(payload, dict) else None
         if code != 200 or not isinstance(data, list):
-            raise RuntimeError(f"Remnawave /api/nodes: HTTP {code}")
+            raise RuntimeError(f"Remnawave /api/nodes: HTTP {code}" + scope_hint(code, "nodes:list"))
         self._nodes_cache = (time.time(), data)
         return data
 
@@ -168,14 +168,14 @@ class Remnawave:
         code, payload = self.request("GET", f"/api/config-profiles/{profile_uuid}")
         data = payload.get("response") if isinstance(payload, dict) else None
         if code != 200 or not isinstance(data, dict):
-            raise RuntimeError(f"Remnawave config profile: HTTP {code}")
+            raise RuntimeError(f"Remnawave config profile: HTTP {code}" + scope_hint(code, "config-profiles:get"))
         return data
 
     def update_config_profile(self, profile_uuid, config):
         code, payload = self.request("PATCH", "/api/config-profiles", {"uuid": profile_uuid, "config": config})
         if code != 200:
             raise RuntimeError(f"Remnawave отклонил изменение профиля: HTTP {code} {find_error_code(payload) or ''}"
-                               f" {str(payload.get('message', ''))[:200]}")
+                               f" {str(payload.get('message', ''))[:200]}" + scope_hint(code, "config-profiles:update"))
         self._nodes_cache = None
         return payload.get("response")
 
@@ -188,12 +188,39 @@ class Remnawave:
             return {"ok": False, "error": payload.get("_transport_error", "connection failed")}
         if code in (401, 403):
             return {"ok": False, "error": f"HTTP {code}: токен отклонён или не хватает прав", "api": api}
+        missing = []
+        if code == 200 and api == "v3":
+            # Nginx routes / Vision need read access to nodes and profiles (writes are not probed).
+            node_code, node_payload = self.request("GET", "/api/nodes")
+            if node_code == 403:
+                missing.append("nodes:list")
+            profiles = {(n.get("configProfile") or {}).get("activeConfigProfileUuid")
+                        for n in (node_payload.get("response") or [] if isinstance(node_payload, dict) else [])}
+            profiles.discard(None)
+            if profiles:
+                profile_code, _ = self.request("GET", f"/api/config-profiles/{sorted(profiles)[0]}")
+                if profile_code == 403:
+                    missing.append("config-profiles:get")
         return {
             "ok": code == 200,
             "api": api,
             "panel_version": self.panel_version,
             "error": None if code == 200 else f"HTTP {code}",
+            "missing_scopes": missing,
+            "required_scopes": REQUIRED_SCOPES,
         }
+
+
+# Remnawave 3.x API token scopes used by Ezhik Guard.
+REQUIRED_SCOPES = {
+    "sanctions": ["users:by-id", "users:stream", "users:disable", "users:enable"],
+    "nginx": ["nodes:list", "config-profiles:get", "config-profiles:update"],
+    "optional": ["system:metadata"],
+}
+
+
+def scope_hint(code, scope):
+    return f" — у API-токена нет права {scope}" if code == 403 else ""
 
 
 def identity(user):

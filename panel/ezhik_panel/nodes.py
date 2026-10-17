@@ -150,6 +150,7 @@ class NodeService:
                                 "port": rw.get("port"), "inbounds": [
                                     {k: i.get(k) for k in ("tag", "type", "network", "security", "port")}
                                     for i in ((rw.get("configProfile") or {}).get("activeInbounds") or [])]} if rw else None
+            out["remnawave_status"] = None if rw else self.remnawave_status(row)
             out["route_checks"] = nginx_routes.check_routes(out["nginx"], rw, (report.get("ports") or {}).get("container_network"))
             if out["nginx"]["mode"] == "vision":
                 out["vision_check"] = nginx_routes.check_vision(out["nginx"], rw, self.vision_context(row, report))
@@ -324,14 +325,26 @@ class NodeService:
             "rw_nodes": (self.remnawave_cache or {}).get("nodes") or [],
         }
 
+    def remnawave_status(self, node):
+        """Why a node is not matched with Remnawave (shown instead of a generic hint)."""
+        cache = self.remnawave_cache or {}
+        if cache.get("error"):
+            return f"Не удалось получить ноды из Remnawave: {cache['error']}"
+        if not cache.get("nodes"):
+            return "Список нод Remnawave ещё не получен — проверьте «Настройки → Remnawave» и права API-ключа (nodes:list)"
+        hint = (node.get("remnawave_node") or "").strip()
+        if hint:
+            return f"В Remnawave нет ноды с UUID или адресом «{hint}»"
+        return "Ни одна нода Remnawave не совпала по IP/домену — укажите UUID ноды в «Параметры»"
+
     def remnawave_node(self, node):
         """Matching Remnawave node from the background cache (never blocks)."""
         cache = (self.remnawave_cache or {}).get("nodes") or []
         facts = loads(node.get("facts"), {}) or {}
         addresses = {facts.get("wan_ip"), node.get("last_ip"), node.get("wan_ip"), node.get("domain")}
-        hint = node.get("remnawave_node")
+        hint = (node.get("remnawave_node") or "").strip().lower()
         for item in cache:
-            if hint and item.get("uuid") == hint:
+            if hint and hint in (str(item.get("uuid") or "").lower(), str(item.get("address") or "").strip().lower()):
                 return item
         for item in cache:
             if str(item.get("address") or "").strip() in addresses:

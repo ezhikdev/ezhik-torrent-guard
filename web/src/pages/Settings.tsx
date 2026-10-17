@@ -160,6 +160,9 @@ function RemnawaveTab({ settings, reload }: { settings: any; reload: () => void 
         {result && (result.ok ? (
           <Callout tone="ok">Подключение успешно · API {result.api === 'v3' ? '3.x' : '2.x'}{result.panel_version ? ` · Remnawave ${result.panel_version}` : ''}</Callout>
         ) : <Callout tone="bad">{result.error}</Callout>)}
+        {result?.ok && result.missing_scopes?.length > 0 && (
+          <Callout tone="warn">Блокировки работают, но для маршрутов Nginx и режима Vision у токена не хватает прав: <span class="mono">{result.missing_scopes.join(', ')}</span>. Для изменения inbound'ов нужно ещё <span class="mono">config-profiles:update</span>.</Callout>
+        )}
         <div class="form-actions">
           <Button icon="zap" loading={busy === 'test'} disabled={!url} onClick={() => run('test', async () => setResult(await api.post('/api/settings/remnawave/test', { url, token: token || undefined })))}>Проверить</Button>
           <Button variant="primary" loading={busy === 'save'} disabled={!url} onClick={() => run('save', async () => {

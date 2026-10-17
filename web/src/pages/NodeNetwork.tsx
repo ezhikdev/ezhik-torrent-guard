@@ -184,7 +184,7 @@ function VisionSetupModal({ node, onClose, onSave }: { node: any; onClose: () =>
   return (
     <Modal wide title="Vision + TLS Fallback" desc="Xray принимает TLS на 443 (VLESS RAW + XTLS Vision). Клиенты VLESS получают туннель, обычные HTTPS-посетители — сайт-заглушку Nginx через fallback." onClose={onClose}>
       <div class="stack">
-        {!node.remnawave && <Callout tone="warn">Нода не сопоставлена с Remnawave — выбрать inbound нельзя. Укажите ноду Remnawave в «Параметры».</Callout>}
+        {!node.remnawave && <Callout tone="warn">Нода не сопоставлена с Remnawave — выбрать inbound нельзя. {node.remnawave_status}</Callout>}
         {node.remnawave && candidates.length === 0 && <Callout tone="warn">На ноде нет подходящего VLESS inbound (RAW, без REALITY). Создайте отдельный inbound для Vision в профиле Remnawave — REALITY и gRPC/WS/XHTTP inbound'ы не трогаются.</Callout>}
         {on443.length > 0 && <Callout tone="bad">Порт 443 уже занимает {on443.map((i: any) => `${i.tag} (${i.security})`).join(', ')} — Vision включить нельзя.</Callout>}
         <Field label="VLESS inbound для Vision" hint="Будет изменён только он: 443, TLS, flow xtls-rprx-vision, fallbacks на Nginx">
@@ -345,9 +345,9 @@ export function NginxCard({ node, onSaved }: { node: any; onSaved: () => void })
           <div style={{ padding: '12px 20px 18px' }} class="stack">
             <div class="row row--wrap">
               <Button size="sm" icon="plus" loading={busy === 'ng'} onClick={() => setEditing(null)}>Добавить маршрут</Button>
-              <Button size="sm" variant="plain" icon="refresh" onClick={() => run('rw', async () => { await api.post('/api/remnawave/refresh'); onSaved(); }, 'Данные Remnawave обновлены')}>Обновить из Remnawave</Button>
+              <Button size="sm" variant="plain" icon="refresh" onClick={() => run('rw', async () => { const r = await api.post('/api/remnawave/refresh'); onSaved(); if (r.error) throw new Error(r.error); }, 'Данные Remnawave обновлены')}>Обновить из Remnawave</Button>
             </div>
-            {!node.remnawave && <div class="tiny faint">Нода не сопоставлена с Remnawave (по адресу). Укажите UUID или адрес ноды Remnawave в «Параметры».</div>}
+            {!node.remnawave && <div class="tiny bad-text">Нода не сопоставлена с Remnawave: {node.remnawave_status}</div>}
             <ToggleRow title="Редирект HTTP → HTTPS" desc="Порт 80 отвечает 301 на https" on={cfg.http_redirect} onChange={(v) => save({ http_redirect: v }, 'Сохранено')} />
             <ToggleRow title="Не проверять чужие конфигурации Nginx" desc="Включайте, только если уверены, что другие server-блоки не слушают те же порты" on={cfg.force} onChange={(v) => save({ force: v }, 'Сохранено')} />
           </div>

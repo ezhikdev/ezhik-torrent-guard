@@ -617,7 +617,10 @@ def build_admin_app(ctx):
         if not profile_uuid or not tag:
             raise HTTPException(400, "Не найден профиль или inbound для синхронизации")
         client = ctx.sanctions.client()
-        profile = client.config_profile(profile_uuid)
+        try:
+            profile = client.config_profile(profile_uuid)
+        except RuntimeError as exc:
+            raise HTTPException(502, str(exc))
         config = profile.get("config") or {}
         try:
             new = nginx_routes.patch_profile(config, tag, route)
@@ -630,7 +633,10 @@ def build_admin_app(ctx):
             after = next(i for i in new.get("inbounds", []) if i.get("tag") == tag)
             return {"preview": True, "profile": profile.get("name"), "inbound": tag, "shared_with": shared,
                     "before": before, "after": after}
-        client.update_config_profile(profile_uuid, new)
+        try:
+            client.update_config_profile(profile_uuid, new)
+        except RuntimeError as exc:
+            raise HTTPException(502, str(exc))
         db.audit(who, "remnawave.profile_inbound_sync", profile_uuid, {"inbound": tag, "node": node_id})
         ctx.refresh_remnawave()
         return {"ok": True, "profile": profile.get("name"), "inbound": tag}
@@ -648,7 +654,10 @@ def build_admin_app(ctx):
         profile_uuid = ((rw_node or {}).get("configProfile") or {}).get("activeConfigProfileUuid")
         if not profile_uuid:
             raise HTTPException(400, "У ноды в Remnawave нет профиля конфигурации")
-        profile = ctx.sanctions.client().config_profile(profile_uuid)
+        try:
+            profile = ctx.sanctions.client().config_profile(profile_uuid)
+        except RuntimeError as exc:
+            raise HTTPException(502, str(exc))
         config = profile.get("config") or {}
         container_dir = (loads(node.get("cert_target"), {}) or {}).get("container_dir") or "/etc/xray/ssl"
         tag = cfg_nginx["vision"]["inbound_tag"]
@@ -664,7 +673,10 @@ def build_admin_app(ctx):
         node, profile_uuid, profile, new, before, after, check = vision_plan(node_id)
         if not check["agent_ready"]:
             raise HTTPException(409, "Агент ещё не освободил порт 443 и не поднял fallback-порты Nginx")
-        ctx.sanctions.client().update_config_profile(profile_uuid, new)
+        try:
+            ctx.sanctions.client().update_config_profile(profile_uuid, new)
+        except RuntimeError as exc:
+            raise HTTPException(502, str(exc))
         db.audit(who, "remnawave.vision_sync", profile_uuid, {"inbound": after.get("tag"), "node": node_id})
         db.set_json(f"vision_sync:{node_id}", {"state": "done", "at": time.time(), "by": who})
         ctx.events.record_system("node", f"Vision: inbound {after.get('tag')} настроен в Remnawave для {node['name']}",
