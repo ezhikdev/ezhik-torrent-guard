@@ -169,10 +169,27 @@ function SyncModal({ node, routeId, onClose, onDone }: { node: any; routeId: str
 
 const MODE_LABEL: Record<string, string> = { direct: 'Direct', frontend: 'Frontend', vision: 'Vision + TLS' };
 
-function visionCandidates(node: any) {
-  return (node.remnawave?.inbounds || []).filter((i: any) => i.type === 'vless' && i.security !== 'reality'
-    && ['raw', 'tcp'].includes(String(i.network || 'raw')));
+function visionUnsuitable(i: any): string | null {
+  if (i.type !== 'vless') return `протокол ${i.type}`;
+  if (String(i.security || '').toLowerCase() === 'reality') return 'REALITY — не трогаем';
+  const network = String(i.network || 'raw').toLowerCase();
+  if (!['raw', 'tcp'].includes(network)) return `транспорт ${network}`;
+  return null;
 }
+
+function visionCandidates(node: any) {
+  return (node.remnawave?.inbounds || []).filter((i: any) => !visionUnsuitable(i));
+}
+
+const VISION_TEMPLATE = `{
+  "tag": "VISION",
+  "listen": "127.0.0.1",
+  "port": 10445,
+  "protocol": "vless",
+  "settings": { "clients": [], "decryption": "none" },
+  "streamSettings": { "network": "raw", "security": "none" },
+  "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+}`;
 
 function VisionSetupModal({ node, onClose, onSave }: { node: any; onClose: () => void; onSave: (v: any) => void }) {
   const current = node.nginx?.vision || {};
@@ -185,7 +202,25 @@ function VisionSetupModal({ node, onClose, onSave }: { node: any; onClose: () =>
     <Modal wide title="Vision + TLS Fallback" desc="Xray принимает TLS на 443 (VLESS RAW + XTLS Vision). Клиенты VLESS получают туннель, обычные HTTPS-посетители — сайт-заглушку Nginx через fallback." onClose={onClose}>
       <div class="stack">
         {!node.remnawave && <Callout tone="warn">Нода не сопоставлена с Remnawave — выбрать inbound нельзя. {node.remnawave_status}</Callout>}
-        {node.remnawave && candidates.length === 0 && <Callout tone="warn">На ноде нет подходящего VLESS inbound (RAW, без REALITY). Создайте отдельный inbound для Vision в профиле Remnawave — REALITY и gRPC/WS/XHTTP inbound'ы не трогаются.</Callout>}
+        {node.remnawave && candidates.length === 0 && (
+          <div class="stack">
+            <Callout tone="warn">На ноде нет подходящего inbound: нужен VLESS на RAW (TCP) без REALITY. Существующие REALITY и gRPC/WS/XHTTP inbound'ы Ezhik Guard не меняет — добавьте для Vision отдельный.</Callout>
+            <div class="small">
+              <b>Как добавить в Remnawave</b> (пока он слушает только 127.0.0.1 — подключения пользователей не меняются):
+              <ol style={{ margin: '6px 0 0', paddingLeft: '18px' }}>
+                <li>Config Profiles → профиль ноды → добавьте inbound в массив <span class="mono">inbounds</span> и сохраните.</li>
+                <li>Nodes → {node.remnawave?.name || 'нода'} → включите этот inbound в списке активных.</li>
+                <li>Internal Squads → добавьте inbound в сквады пользователей, которым нужен Vision.</li>
+                <li>Здесь нажмите «Обновить из Remnawave», выберите inbound и включите Vision — порт 443, TLS, flow и fallbacks Ezhik Guard выставит сам после вашего подтверждения.</li>
+                <li>После синхронизации: Hosts → новый host для этого inbound (адрес — домен ноды, порт 443, SNI — домен ноды), иначе он не попадёт в подписки.</li>
+              </ol>
+            </div>
+            <CodeBox text={VISION_TEMPLATE} />
+          </div>
+        )}
+        {(node.remnawave?.inbounds || []).length > 0 && (
+          <div class="tiny faint">Inbound'ы ноды: {(node.remnawave.inbounds as any[]).map((i) => `${i.tag} (${i.type}/${i.network || 'raw'}/${i.security || 'none'}${visionUnsuitable(i) ? ` — ${visionUnsuitable(i)}` : ' — подходит'})`).join(' · ')}</div>
+        )}
         {on443.length > 0 && <Callout tone="bad">Порт 443 уже занимает {on443.map((i: any) => `${i.tag} (${i.security})`).join(', ')} — Vision включить нельзя.</Callout>}
         <Field label="VLESS inbound для Vision" hint="Будет изменён только он: 443, TLS, flow xtls-rprx-vision, fallbacks на Nginx">
           <select class="select" value={v.inbound_tag} onChange={(e) => set('inbound_tag', e.currentTarget.value)}>
@@ -212,7 +247,7 @@ function VisionSyncModal({ node, onClose, onDone }: { node: any; onClose: () => 
   const { data, error, loading } = useData(() => api.post(`/api/nodes/${node.id}/nginx/vision-sync`, {}), []);
   const { busy, run } = useAction();
   return (
-    <Modal wide title="Vision: изменение inbound в Remnawave" desc="Меняется только выбранный inbound профиля. Пользователи, другие inbound'ы и другие ноды не затрагиваются." onClose={onClose}>
+    <Modal wide title="Vision: изменение inbound в Remnawave" desc={data?.shared_with?.length ? "Меняется только выбранный inbound профиля, но он общий — изменение применится и к нодам: " + data.shared_with.join(', ') + "." : "Меняется только выбранный inbound профиля. Пользователи, другие inbound'ы и другие ноды не затрагиваются."} onClose={onClose}>
       <div class="stack">
         {loading && <div class="small faint">Загрузка профиля…</div>}
         {error && <Callout tone="bad">{error}</Callout>}
@@ -220,6 +255,7 @@ function VisionSyncModal({ node, onClose, onDone }: { node: any; onClose: () => 
           <>
             <div class="small">Профиль <b>{data.profile}</b>, inbound <span class="mono">{data.inbound}</span></div>
             <ul class="small" style={{ margin: 0, paddingLeft: '18px' }}>{data.drift.map((d: string) => <li key={d}>{d}</li>)}</ul>
+            {(data.warnings || []).map((w: string) => <Callout tone="bad" key={w}>{w}</Callout>)}
             {data.notes.map((n: string) => <Callout tone="warn" key={n}>{n}</Callout>)}
             <div class="grid grid--2">
               <div><div class="eyebrow">Сейчас</div><CodeBox copy={false} text={JSON.stringify(data.before, null, 2)} /></div>
@@ -257,6 +293,7 @@ function VisionPanel({ node, onSaved, onEdit }: { node: any; onSaved: () => void
         <dt>Состояние</dt><dd>{e2e.ok ? <Badge tone="ok" size="sm">работает</Badge> : <Badge tone="warn" size="sm">не готово</Badge>} <span class="small">{e2e.summary || 'агент ещё не проверял'}</span></dd>
       </dl>
       {(c.problems || []).map((p: string) => <Callout tone="bad" key={p}>{p}</Callout>)}
+      {(c.warnings || []).map((p: string) => <Callout tone="warn" key={p}>{p}</Callout>)}
       {(c.drift || []).length > 0 && <div class="small">Нужно изменить в Remnawave: <span class="muted">{c.drift.join(' · ')}</span></div>}
       {(c.notes || []).map((p: string) => <div class="tiny faint" key={p}>{p}</div>)}
       {pending?.state === 'waiting' && <Callout icon="clock">Синхронизация подтверждена и выполнится, как только агент поднимет fallback Nginx. <Button size="sm" variant="plain" onClick={() => run('c', async () => { await api.post(`/api/nodes/${node.id}/nginx/vision-sync`, { cancel: true }); onSaved(); }, 'Отменено')}>Отменить</Button></Callout>}

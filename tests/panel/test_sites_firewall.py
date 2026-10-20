@@ -200,7 +200,9 @@ class VisionTests(unittest.TestCase):
         self.assertTrue(any("443" in d for d in result["drift"]))
         other = self.rw(self.inbound(), uuid="n2")
         shared = nginx_routes.check_vision(self.cfg(), node, self.ctx(rw_nodes=[node, other]))
-        self.assertFalse(shared["can_sync"])
+        self.assertTrue(shared["can_sync"])  # shared inbound only warns; the admin decides
+        self.assertFalse(shared["problems"])
+        self.assertTrue(any("n2" in w for w in shared["warnings"]))
         self.assertEqual(shared["shared_with"], ["n2"])
         nocert = nginx_routes.check_vision(self.cfg(), node, self.ctx(cert=None))
         self.assertTrue(any("сертификат" in p for p in nocert["problems"]))

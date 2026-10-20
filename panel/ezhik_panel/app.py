@@ -707,6 +707,7 @@ def build_admin_app(ctx):
         if not body.get("confirm"):
             return {"preview": True, "profile": profile.get("name"), "inbound": after.get("tag"),
                     "before": before, "after": after, "drift": check["drift"], "notes": check["notes"],
+                    "warnings": check["warnings"], "shared_with": check["shared_with"],
                     "agent_ready": check["agent_ready"]}
         if check["agent_ready"]:
             return apply_vision(node_id, who)

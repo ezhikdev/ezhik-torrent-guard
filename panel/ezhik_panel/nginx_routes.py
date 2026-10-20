@@ -335,10 +335,11 @@ def check_vision(cfg, rw_node, ctx):
 
     ctx: cert (dict|None), cert_state, cert_target, server_name, nginx_state,
     container_network, rw_nodes (all Remnawave nodes from the cache).
-    Returns problems (block sync), drift (what a sync would change) and notes.
+    Returns problems (block sync), warnings (shown, but the admin may sync anyway),
+    drift (what a sync would change) and notes.
     """
     vision = cfg["vision"]
-    problems, drift, notes = [], [], []
+    problems, warnings, drift, notes = [], [], [], []
     tag = vision["inbound_tag"]
     inbound = next((i for i in _active(rw_node) if i.get("tag") == tag), None) if tag else None
     profile_uuid = ((rw_node or {}).get("configProfile") or {}).get("activeConfigProfileUuid")
@@ -361,8 +362,8 @@ def check_vision(cfg, rw_node, ctx):
                     any(i.get("uuid") == inbound.get("uuid") for i in prof.get("activeInbounds") or []):
                 shared.append(str(other.get("name")))
         if shared:
-            problems.append("inbound активен и на других нодах общего профиля (" + ", ".join(shared)
-                            + ") — автоматически не меняем; вынесите Vision в отдельный inbound этой ноды")
+            warnings.append("inbound активен и на других нодах общего профиля (" + ", ".join(shared)
+                            + ") — изменение затронет и их; лучше вынести Vision в отдельный inbound этой ноды")
     if not ctx.get("cert"):
         problems.append("Ноде не назначен сертификат (карточка «SSL-сертификат»)")
     else:
@@ -410,7 +411,8 @@ def check_vision(cfg, rw_node, ctx):
     agent_ready = state.get("mode") == "vision" and bool(state.get("fallback_ok"))
     if cfg["mode"] == "vision" and not agent_ready:
         notes.append("Агент ещё не переключил Nginx на локальные fallback-порты — синхронизация станет доступна после этого")
-    return {"inbound": tag or None, "problems": problems, "drift": drift, "notes": notes, "shared_with": shared,
+    return {"inbound": tag or None, "problems": problems, "warnings": warnings, "drift": drift, "notes": notes,
+            "shared_with": shared,
             "ok": not problems and not drift, "agent_ready": agent_ready,
             "can_sync": bool(inbound) and not problems and bool(drift) and agent_ready,
             "e2e": state.get("e2e"), "cert_file": cert_file}
