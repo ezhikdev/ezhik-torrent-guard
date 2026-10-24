@@ -278,9 +278,11 @@ def build_admin_app(ctx):
         return {"done": ctx.nodes.bulk(ids, "update_agent", None, who)}
 
     @app.post("/api/nodes/reorder")
-    def reorder(body: dict = Body(...), _=Depends(actor)):
-        ctx.nodes.reorder([str(i) for i in body.get("ids") or []])
-        return {"ok": True}
+    def reorder(body: dict = Body(...), who=Depends(actor)):
+        ids = body.get("ids")
+        if not isinstance(ids, list):
+            raise HTTPException(400, "ids: ожидается список")
+        return {"ids": ctx.nodes.reorder([str(i) for i in ids[:2000]], who)}
 
     # ------------------------------------------------------------- events
 

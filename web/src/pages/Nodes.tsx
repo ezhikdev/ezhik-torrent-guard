@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'preact/hooks';
+import type { JSX } from 'preact';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { api } from '../api';
 import { Icon } from '../components/Icon';
 import {
@@ -6,6 +7,7 @@ import {
   Segmented, StatusDot, Switch, confirmDialog, useAction, useData,
 } from '../components/ui';
 import { ago, uptime } from '../format';
+import { canAnimate, SPRING } from '../motion';
 import { navigate, toast, toastError, useRoute } from '../state';
 
 type Filter = 'all' | 'online' | 'offline' | 'problems' | 'outdated';
@@ -127,6 +129,113 @@ export function AddNodeModal({ onClose, onCreated }: { onClose: () => void; onCr
   );
 }
 
+type Drag = { id: string; from: number; to: number; dy: number; h: number };
+
+const moveItem = (ids: string[], from: number, to: number) => {
+  const next = ids.slice();
+  const [item] = next.splice(from, 1);
+  next.splice(to, 0, item);
+  return next;
+};
+
+/**
+ * Drag and drop of table rows by their handle (mouse, pen, touch).
+ * The dragged row follows the pointer, the others spring aside to make room;
+ * the window scrolls when the pointer nears its edge. `onDrop` receives the
+ * new order (null if unchanged) and where the row was on screen, so it can
+ * settle smoothly.
+ */
+function useRowReorder(enabled: boolean, onDrop: (next: string[] | null, id: string, top: number) => void) {
+  const body = useRef<HTMLTableSectionElement>(null);
+  const [drag, setDrag] = useState<Drag | null>(null);
+
+  const start = (e: JSX.TargetedPointerEvent<HTMLButtonElement>, id: string) => {
+    if (!enabled || e.button !== 0 || !body.current) return;
+    const rows = Array.from(body.current.querySelectorAll<HTMLTableRowElement>(':scope > tr[data-id]'));
+    const ids = rows.map((r) => r.dataset.id!);
+    const from = ids.indexOf(id);
+    if (from < 0) return;
+    e.preventDefault();
+    const pointer = e.pointerId;
+    const boxes = rows.map((r) => {
+      const b = r.getBoundingClientRect();
+      return { top: b.top + window.scrollY, h: b.height };
+    });
+    const self = boxes[from];
+    const last = boxes[boxes.length - 1];
+    const minDy = boxes[0].top - self.top;
+    const maxDy = last.top + last.h - (self.top + self.h);
+    const startY = e.clientY + window.scrollY;
+    let clientY = e.clientY;
+    let to = from;
+    let dy = 0;
+
+    const update = () => {
+      dy = Math.max(minDy, Math.min(maxDy, clientY + window.scrollY - startY));
+      // A neighbour is passed once the leading edge of the dragged row crosses
+      // its middle (also true at the clamped ends of the list).
+      const top = self.top + dy;
+      const bottom = top + self.h;
+      const passedDown = boxes.filter((b, i) => i > from && bottom > b.top + b.h / 2).length;
+      const passedUp = boxes.filter((b, i) => i < from && top < b.top + b.h / 2).length;
+      to = from + passedDown - passedUp;
+      setDrag({ id, from, to, dy, h: self.h });
+    };
+    let raf = 0;
+    const tick = () => {
+      const edge = 80;
+      const speed = clientY < edge ? -(edge - clientY) / 4 : clientY > innerHeight - edge ? (clientY - innerHeight + edge) / 4 : 0;
+      if (speed) {
+        window.scrollBy(0, speed);
+        update();
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    const move = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointer) return;
+      clientY = ev.clientY;
+      update();
+    };
+    const end = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointer) return;
+      cancelAnimationFrame(raf);
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', end);
+      window.removeEventListener('pointercancel', end);
+      document.body.classList.remove('is-dragging-row');
+      setDrag(null);
+      if (Math.abs(dy) > 3) {
+        // Released over the same row: the browser would treat it as a click on the row.
+        const swallow = (c: MouseEvent) => c.stopPropagation();
+        window.addEventListener('click', swallow, { capture: true, once: true });
+        window.setTimeout(() => window.removeEventListener('click', swallow, { capture: true }), 0);
+      }
+      const top = self.top + dy - window.scrollY;
+      onDrop(ev.type === 'pointerup' && to !== from ? moveItem(ids, from, to) : null, id, top);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', end);
+    window.addEventListener('pointercancel', end);
+    document.body.classList.add('is-dragging-row');
+    raf = requestAnimationFrame(tick);
+    setDrag({ id, from, to, dy, h: self.h });
+  };
+
+  /** Transform for the row at `index` while a drag is in progress. */
+  const rowStyle = (index: number): JSX.CSSProperties | undefined => {
+    if (!drag) return undefined;
+    let y = 0;
+    if (index === drag.from) y = drag.dy;
+    else if (drag.from < drag.to && index > drag.from && index <= drag.to) y = -drag.h;
+    else if (drag.from > drag.to && index >= drag.to && index < drag.from) y = drag.h;
+    return y ? { transform: `translate3d(0, ${y}px, 0)` } : undefined;
+  };
+
+  const rowClass = (id: string) => (!drag ? '' : drag.id === id ? 'is-dragging' : 'is-shifting');
+
+  return { body, drag, start, rowStyle, rowClass };
+}
+
 export function Nodes() {
   const { params } = useRoute();
   const { data, error, loading, reload, setData } = useData(() => api.get('/api/nodes'), [], 10000);
@@ -135,8 +244,17 @@ export function Nodes() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [adding, setAdding] = useState(params.get('add') === '1');
   const { busy, run } = useAction();
+  // Local order while a new one is being saved (polling must not undo it).
+  const [order, setOrder] = useState<string[] | null>(null);
+  const [settle, setSettle] = useState<{ id: string; top?: number; focus?: boolean; n: number } | null>(null);
+  const saving = useRef<Promise<unknown>>(Promise.resolve());
 
-  const nodes: any[] = data?.nodes || [];
+  const serverNodes: any[] = data?.nodes || [];
+  const nodes = useMemo(() => {
+    if (!order) return serverNodes;
+    const at = new Map(order.map((id, i) => [id, i]));
+    return [...serverNodes].sort((a, b) => (at.get(a.id) ?? 1e9) - (at.get(b.id) ?? 1e9));
+  }, [serverNodes, order]);
   const counts = useMemo(() => ({
     online: nodes.filter((n) => n.online).length,
     offline: nodes.filter((n) => !n.online && n.status !== 'pending').length,
@@ -152,6 +270,55 @@ export function Nodes() {
     if (filter === 'outdated') return n.update_available;
     return true;
   });
+
+  const canReorder = filter === 'all' && !query.trim() && nodes.length > 1;
+
+  const saveOrder = (next: string[], announce: boolean) => {
+    setOrder(next);
+    const job = saving.current.then(async () => {
+      try {
+        await api.post('/api/nodes/reorder', { ids: next });
+        if (announce) toast('Порядок нод сохранён');
+      } catch (e) {
+        toastError(e);
+      }
+    });
+    saving.current = job;
+    job.then(() => reload(true)).then(() => setOrder((current) => (current === next ? null : current)));
+  };
+
+  const reorder = useRowReorder(canReorder, (next, id, top) => {
+    if (next) saveOrder(next, true);
+    setSettle({ id, top, n: Date.now() });
+  });
+
+  const moveBy = (id: string, step: number) => {
+    const ids = nodes.map((n) => n.id);
+    const from = ids.indexOf(id);
+    const to = Math.max(0, Math.min(ids.length - 1, from + step));
+    if (from < 0 || to === from) return;
+    saveOrder(moveItem(ids, from, to), false);
+    setSettle({ id, focus: true, n: Date.now() });
+  };
+
+  // The dropped row glides from where it was released into its new place.
+  useLayoutEffect(() => {
+    if (!settle) return;
+    const row = reorder.body.current?.querySelector<HTMLTableRowElement>(`tr[data-id="${settle.id}"]`);
+    if (!row) return;
+    if (settle.focus) row.querySelector<HTMLButtonElement>('.drag-handle')?.focus();
+    if (settle.top != null && canAnimate()) {
+      const delta = settle.top - row.getBoundingClientRect().top;
+      if (Math.abs(delta) > 0.5) {
+        row.animate([{ transform: `translate3d(0, ${delta}px, 0)` }, { transform: 'translate3d(0, 0, 0)' }], { duration: 380, easing: SPRING });
+      }
+    }
+    row.classList.remove('is-dropped');
+    void row.offsetWidth;
+    row.classList.add('is-dropped');
+    const t = window.setTimeout(() => row.classList.remove('is-dropped'), 950);
+    return () => clearTimeout(t);
+  }, [settle]);
 
   if (loading && !data) return <Loading />;
   if (error && !data) return <ErrorState error={error} onRetry={reload} />;
@@ -212,6 +379,12 @@ export function Nodes() {
           { value: 'problems', label: `Проблемы ${counts.problems}` },
           { value: 'outdated', label: `Устарели ${counts.outdated}` },
         ]} />
+        {nodes.length > 1 && (
+          <span class="order-hint">
+            <Icon name="sort" size={15} />
+            {canReorder ? 'Перетащите ноду за ⠿, чтобы задать порядок' : 'Порядок меняется без фильтра и поиска'}
+          </span>
+        )}
       </div>
 
       <div class="card card--flush">
@@ -226,6 +399,7 @@ export function Nodes() {
             <table class="table">
               <thead>
                 <tr>
+                  <th class="col-drag" aria-label="Порядок" />
                   <th class="col-check">
                     <input type="checkbox" class="checkbox" checked={allChecked} onChange={() => setSelected(allChecked ? new Set() : new Set(visible.map((n) => n.id)))} />
                   </th>
@@ -239,12 +413,31 @@ export function Nodes() {
                   <th class="col-actions" />
                 </tr>
               </thead>
-              <tbody>
-                {visible.map((n) => {
+              <tbody ref={reorder.body}>
+                {visible.map((n, index) => {
                   const st = nodeState(n);
                   const mem = n.metrics?.mem_total ? (100 * n.metrics.mem_used) / n.metrics.mem_total : null;
                   return (
-                    <tr key={n.id} class="is-clickable" onClick={() => navigate(`/nodes/${n.id}`)}>
+                    <tr key={n.id} data-id={n.id} class={`is-clickable ${reorder.rowClass(n.id)}`} style={reorder.rowStyle(index)}
+                      onClick={() => navigate(`/nodes/${n.id}`)}>
+                      <td class="col-drag" onClick={(e) => e.stopPropagation()}>
+                        <button
+                          type="button"
+                          class="drag-handle"
+                          disabled={!canReorder}
+                          title={canReorder ? 'Перетащите, чтобы изменить порядок (или ↑/↓)' : 'Сбросьте фильтр и поиск, чтобы менять порядок'}
+                          aria-label={`Порядок: ${n.name}. Стрелки вверх и вниз перемещают ноду`}
+                          onPointerDown={(e) => reorder.start(e, n.id)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+                              e.preventDefault();
+                              moveBy(n.id, e.key === 'ArrowUp' ? -1 : 1);
+                            }
+                          }}
+                        >
+                          <Icon name="grip" size={18} stroke={3} />
+                        </button>
+                      </td>
                       <td class="col-check" onClick={(e) => e.stopPropagation()}>
                         <input type="checkbox" class="checkbox" checked={selected.has(n.id)} onChange={() => {
                           const next = new Set(selected);

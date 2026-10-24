@@ -2,6 +2,7 @@ import type { ComponentChildren, JSX } from 'preact';
 import { createPortal } from 'preact/compat';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { navigate, toast, toastError } from '../state';
+import { LoadingIndicator } from './expressive';
 import { Icon } from './Icon';
 
 // ------------------------------------------------------------------ data
@@ -131,7 +132,11 @@ export function Switch({ on, onChange, disabled, label }: { on: boolean; onChang
         e.stopPropagation();
         onChange(!on);
       }}
-    />
+    >
+      <span class="switch__thumb">
+        <Icon name={on ? 'check' : 'x'} size={14} stroke={2.4} />
+      </span>
+    </button>
   );
 }
 
@@ -192,7 +197,7 @@ export function Spinner({ large }: { large?: boolean }) {
 export function Loading() {
   return (
     <div class="center-screen">
-      <Spinner large />
+      <LoadingIndicator size={56} />
     </div>
   );
 }
@@ -201,7 +206,7 @@ export function ErrorState({ error, onRetry }: { error: string; onRetry?: () => 
   return (
     <div class="card">
       <div class="empty">
-        <div class="empty__icon" style={{ background: 'var(--bad-soft)', color: 'var(--bad)' }}>
+        <div class="empty__icon empty__icon--bad">
           <Icon name="alert" size={24} />
         </div>
         <div class="empty__title">Не удалось загрузить данные</div>

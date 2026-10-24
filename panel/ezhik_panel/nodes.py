@@ -653,9 +653,21 @@ class NodeService:
             self._forget(node)
             self.events.record_system("node", f"Нода {node['name']} удалена, агент деинсталлирован")
 
-    def reorder(self, ids):
-        for index, node_id in enumerate(ids):
-            self.db.execute("UPDATE nodes SET sort=? WHERE id=?", (index, node_id))
+    def reorder(self, ids, actor="admin"):
+        """Manual order (drag and drop in the UI). Unknown and repeated ids are
+        ignored; nodes missing from the list (added meanwhile in another tab)
+        keep their relative order after the listed ones."""
+        current = [r["id"] for r in self.db.all("SELECT id FROM nodes ORDER BY sort, name COLLATE NOCASE")]
+        known = set(current)
+        ordered = list(dict.fromkeys(i for i in ids if i in known))
+        listed = set(ordered)
+        ordered += [i for i in current if i not in listed]
+        if ordered == current:
+            return ordered
+        with self.db.tx() as conn:
+            conn.executemany("UPDATE nodes SET sort=? WHERE id=?", [(index, node_id) for index, node_id in enumerate(ordered)])
+        self.db.audit(actor, "node.reorder", None, {"count": len(ordered)})
+        return ordered
 
     # ------------------------------------------------------------ history
 

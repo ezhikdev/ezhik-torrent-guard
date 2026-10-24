@@ -1,159 +1,272 @@
-/* ================================================================ shell */
+/* ==========================================================================
+   Shell — the navigation rail of the Ezhik VPN WebApp desktop layout:
+   a floating tonal card at the window edge with one pill indicator that
+   glides (and stretches) between items. Below 1080px the same rail becomes
+   a drawer opened from a floating top bar.
+   ========================================================================== */
 
 .shell {
-  display: grid;
-  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
   min-height: 100vh;
 }
 
 .sidebar {
-  position: sticky;
-  top: 0;
-  height: 100vh;
+  position: fixed;
+  top: var(--rail-edge);
+  bottom: var(--rail-edge);
+  left: var(--rail-edge);
+  z-index: 20;
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 18px 14px;
-  border-right: 1px solid var(--line);
-  background: color-mix(in srgb, var(--card) 55%, transparent);
-  -webkit-backdrop-filter: blur(16px);
-  backdrop-filter: blur(16px);
-  z-index: 20;
+  gap: 2px;
+  width: var(--rail-w);
+  padding: 14px;
+  border-radius: var(--r-xl);
+  background: var(--nav);
+  box-shadow: var(--shadow-1);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+  animation: rail-in 0.7s var(--spring) backwards 0.05s;
+}
+
+.sidebar::-webkit-scrollbar {
+  display: none;
+}
+
+@keyframes rail-in {
+  from {
+    opacity: 0;
+    transform: translate3d(-16px, 0, 0);
+  }
 }
 
 .brand {
   display: flex;
   align-items: center;
-  gap: 11px;
-  padding: 4px 8px 18px;
+  gap: 10px;
+  padding: 2px 4px 14px;
 }
 
 .brand__logo {
   display: grid;
   place-items: center;
-  width: 38px;
-  height: 38px;
-  border-radius: 12px;
-  background: var(--card);
-  border: 1px solid var(--line);
-  box-shadow: var(--shadow);
+  flex: none;
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  background: var(--well);
 }
 
 .brand__logo img {
-  filter: var(--logo-filter);
   display: block;
+  filter: var(--logo-filter);
 }
 
 .brand__name {
-  font-weight: 650;
-  letter-spacing: -0.02em;
-  font-size: 16px;
+  font-weight: 700;
+  font-size: 17px;
+  letter-spacing: -0.025em;
   line-height: 1.1;
 }
 
 .brand__sub {
+  display: inline-block;
+  margin-top: 3px;
+  padding: 1px 7px;
+  border-radius: var(--r-full);
+  background: var(--sc);
+  color: var(--on-sc);
   font-family: var(--mono);
   font-size: 10.5px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--ink-3);
+  font-weight: 600;
+  letter-spacing: 0.02em;
 }
 
 .nav-section {
-  margin: 14px 10px 6px;
-  font-family: var(--mono);
-  font-size: 10.5px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--ink-3);
+  margin: 12px 14px 6px;
+  font-size: 12.5px;
+  font-weight: 650;
+  letter-spacing: -0.005em;
+  color: var(--primary);
+}
+
+/* The active pill: one element that slides to the active item. */
+.nav-thumb {
+  position: absolute;
+  top: 0;
+  left: 14px;
+  right: 14px;
+  z-index: 0;
+  height: var(--thumb-h, 48px);
+  border-radius: var(--r-full);
+  background: var(--pc);
+  pointer-events: none;
+  transform: translateY(var(--thumb-y, 0));
+  transition:
+    transform var(--d-spring) var(--spring),
+    opacity var(--dur-2) var(--ease);
+}
+
+@supports (translate: 1px) {
+  .nav-thumb {
+    transform: none;
+    translate: 0 var(--thumb-y, 0);
+    transition:
+      translate var(--d-spring) var(--spring),
+      opacity var(--dur-2) var(--ease);
+  }
+}
+
+.nav-thumb.is-hidden {
+  opacity: 0;
 }
 
 .nav-item {
   position: relative;
+  z-index: 1;
   display: flex;
   align-items: center;
-  gap: 11px;
-  height: 40px;
-  padding: 0 12px;
-  border-radius: 12px;
+  flex: none;
+  gap: 12px;
+  height: 48px;
+  padding: 0 14px 0 16px;
+  border-radius: var(--r-full);
+  overflow: hidden;
   color: var(--ink-2);
-  font-weight: 520;
+  font-size: 14.5px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
   transition:
-    background 0.2s var(--ease),
-    color 0.2s var(--ease);
+    color 0.25s var(--ease-emph),
+    border-radius var(--d-bouncy) var(--spring-bouncy);
 }
 
-.nav-item:hover {
-  background: var(--accent-soft);
-  color: var(--ink);
+.nav-item:active {
+  border-radius: 16px;
+}
+
+.nav-item .icon {
+  transition: transform var(--d-bouncy) var(--spring-bouncy);
+}
+
+.nav-item:active .icon {
+  transform: scale(0.88);
 }
 
 .nav-item.is-active {
-  background: var(--card);
-  color: var(--ink);
-  box-shadow: var(--shadow);
-  border: 1px solid var(--line);
+  color: var(--on-pc);
+  font-weight: 680;
 }
 
-.nav-item.is-active .icon {
-  color: var(--accent);
+@media (hover: hover) {
+  .nav-item:not(.is-active):hover {
+    background: rgba(128, 128, 140, 0.08);
+    background: color-mix(in srgb, currentColor 7%, transparent);
+    color: var(--ink);
+  }
+}
+
+/* Without the sliding thumb (no JS layout yet) the item paints itself. */
+.sidebar:not(.has-thumb) .nav-item.is-active {
+  background: var(--pc);
 }
 
 .nav-item__count {
-  margin-left: auto;
-  min-width: 22px;
-  height: 20px;
-  padding: 0 7px;
-  border-radius: 999px;
   display: grid;
   place-items: center;
+  margin-left: auto;
+  min-width: 24px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: var(--r-full);
+  background: var(--ec);
+  color: var(--on-ec);
   font-size: 11.5px;
-  font-weight: 600;
-  background: var(--bad-soft);
-  color: var(--bad);
+  font-weight: 700;
+  animation: pop 0.45s var(--spring-bouncy) both;
 }
 
 .nav-item__count--muted {
-  background: var(--accent-soft);
-  color: var(--accent-ink);
+  background: var(--sc);
+  color: var(--on-sc);
+}
+
+.nav-item.is-active .nav-item__count--muted {
+  background: var(--primary);
+  color: var(--on-primary);
 }
 
 .sidebar__foot {
-  margin-top: auto;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
+  margin-top: auto;
   padding-top: 14px;
-  border-top: 1px dotted var(--line-2);
+}
+
+.theme-toggle--label {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 48px;
+  padding: 0 16px;
+  border-radius: var(--r-full);
+  overflow: hidden;
+  background: var(--well);
+  color: var(--ink-2);
+  font-size: 14px;
+  font-weight: 600;
+  transition: border-radius var(--d-bouncy) var(--spring-bouncy);
+}
+
+.theme-toggle--label:active {
+  border-radius: 16px;
 }
 
 .user-chip {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 6px 8px;
+  padding: 8px 8px 8px 10px;
+  border-radius: var(--r-lg);
+  background: var(--well);
 }
 
 .avatar {
   display: grid;
   place-items: center;
-  width: 32px;
-  height: 32px;
-  border-radius: 10px;
-  background: var(--accent-soft);
-  color: var(--accent-ink);
-  font-weight: 650;
+  flex: none;
+  width: 36px;
+  height: 36px;
+  background: var(--tc);
+  color: var(--on-tc);
+  font-weight: 700;
   text-transform: uppercase;
+  clip-path: url(#shape-cookie9);
+}
+
+.user-chip .icon-btn {
+  background: var(--card);
+}
+
+.main-wrap {
+  min-width: 0;
+  margin-left: calc(var(--rail-edge) + var(--rail-w));
 }
 
 .main {
   min-width: 0;
-  padding: 26px 34px 60px;
+  padding: 26px 36px 64px;
 }
 
 .content {
-  max-width: 1360px;
+  max-width: 1480px;
   margin: 0 auto;
+}
+
+.screen {
+  animation: screen-in 0.5s var(--spring) both;
 }
 
 .page-head {
@@ -161,34 +274,47 @@
   align-items: flex-end;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 22px;
   flex-wrap: wrap;
+  padding: 4px 4px 4px;
 }
 
 .page-title {
-  font-size: 30px;
-  line-height: 1.1;
-  font-weight: 650;
-  letter-spacing: -0.035em;
+  font-size: 40px;
+  line-height: 1.06;
+  font-weight: 700;
+  letter-spacing: -0.045em;
 }
 
 .page-sub {
-  margin-top: 6px;
+  margin-top: 8px;
   color: var(--ink-2);
-  font-size: 14px;
+  font-size: 14.5px;
 }
 
 .crumbs {
   display: flex;
   align-items: center;
-  gap: 6px;
-  margin-bottom: 10px;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: -4px;
   font-size: 13px;
+  font-weight: 600;
   color: var(--ink-3);
 }
 
-.crumbs a:hover {
-  color: var(--ink);
+.crumbs a {
+  display: inline-flex;
+  align-items: center;
+  height: 30px;
+  padding: 0 12px;
+  border-radius: var(--r-full);
+  background: var(--sc);
+  color: var(--on-sc);
+  transition: border-radius var(--d-bouncy) var(--spring-bouncy);
+}
+
+.crumbs a:active {
+  border-radius: 10px;
 }
 
 /* ---------------------------------------------------------- mobile bar */
@@ -197,52 +323,81 @@
   display: none;
 }
 
-@media (max-width: 1100px) {
+.scrim {
+  display: none;
+}
+
+@media (max-width: 1360px) {
   .main {
-    padding: 22px 22px 60px;
+    padding: 22px 26px 60px;
   }
 }
 
-@media (max-width: 900px) {
-  .shell {
-    grid-template-columns: 1fr;
+@media (max-width: 1079px) {
+  .main-wrap {
+    margin-left: 0;
   }
 
   .sidebar {
-    position: fixed;
-    inset: 0 auto 0 0;
-    width: min(84vw, 300px);
-    transform: translateX(-102%);
-    transition: transform 0.3s var(--ease);
-    background: var(--card);
-    box-shadow: var(--shadow-lg);
+    top: 12px;
+    bottom: 12px;
+    left: 12px;
+    z-index: 60;
+    width: min(calc(100vw - 24px), 300px);
+    box-shadow: var(--shadow-3);
+    transform: translate3d(calc(-100% - 24px), 0, 0);
+    transition: transform 0.3s var(--ease-emph-in);
+    animation: none;
   }
 
   .shell.nav-open .sidebar {
     transform: none;
+    transition: transform 0.5s var(--spring);
   }
 
   .scrim {
     position: fixed;
     inset: 0;
-    z-index: 15;
-    background: rgba(5, 6, 10, 0.45);
-    animation: fade-in 0.2s both;
+    z-index: 55;
+    display: block;
+    background: var(--scrim);
+    animation: fade-in 0.25s var(--ease-emph) both;
   }
 
   .mobilebar {
     position: sticky;
-    top: 0;
-    z-index: 10;
+    top: 10px;
+    z-index: 30;
     display: flex;
     align-items: center;
-    gap: 12px;
-    height: 56px;
-    padding: 0 16px;
-    border-bottom: 1px solid var(--line);
+    gap: 10px;
+    height: 60px;
+    margin: 10px 12px 0;
+    padding: 0 8px;
+    border-radius: var(--r-full);
     background: var(--glass);
     -webkit-backdrop-filter: blur(16px);
     backdrop-filter: blur(16px);
+    box-shadow: var(--shadow-2);
+  }
+
+  .mobilebar__brand {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+    min-width: 0;
+    font-weight: 700;
+    font-size: 16px;
+    letter-spacing: -0.02em;
+  }
+
+  .mobilebar__brand img {
+    filter: var(--logo-filter);
+  }
+
+  .mobilebar .icon-btn {
+    background: var(--well);
   }
 
   .main {
@@ -250,6 +405,12 @@
   }
 
   .page-title {
-    font-size: 25px;
+    font-size: 32px;
+  }
+}
+
+@media (max-width: 560px) {
+  .page-title {
+    font-size: 28px;
   }
 }

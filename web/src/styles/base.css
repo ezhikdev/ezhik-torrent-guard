@@ -1,113 +1,206 @@
 /* ==========================================================================
-   Ezhik Guard — design tokens (shared with the Ezhik VPN WebApp):
-   cool off-white / near-black surfaces, periwinkle accents, slate navy,
-   dotted textures and pill controls. Both themes use the same hues.
+   Ezhik Guard — "Ezhik Expressive" design tokens, shared with the Ezhik VPN
+   WebApp: tonal surfaces built from the periwinkle seed, a warm peach
+   tertiary accent, a mixed shape scale (big soft containers, pill buttons,
+   small inner corners in groups) and spring motion. Shadows are reserved for
+   floating layers.
    ========================================================================== */
 
 :root {
   --font: 'Geist Variable', 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   --mono: 'Geist Mono Variable', 'Geist Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
 
+  /* Shape scale: containers are soft, groups use small inner corners. */
+  --r-xs: 6px;
+  --r-sm: 10px;
+  --r-md: 16px;
+  --r-lg: 24px;
+  --r-xl: 28px;
+  --r-2xl: 36px;
+  --r-full: 999px;
+  --radius: var(--r-xl);
+  --radius-sm: var(--r-md);
+  --radius-xs: var(--r-sm);
+
+  --rail-w: 256px;
+  --rail-edge: 16px;
+
+  /* Motion. Springs are sampled into linear() below; these are fallbacks. */
   --ease: cubic-bezier(0.22, 1, 0.36, 1);
   --ease-in: cubic-bezier(0.55, 0, 0.75, 0.3);
-  --spring: cubic-bezier(0.3, 1.12, 0.45, 1);
-  --radius: 20px;
-  --radius-sm: 13px;
-  --radius-xs: 9px;
-  --sidebar-w: 248px;
+  --ease-emph: cubic-bezier(0.2, 0, 0, 1);
+  --ease-emph-in: cubic-bezier(0.3, 0, 0.8, 0.15);
+  --spring: cubic-bezier(0.3, 1.1, 0.4, 1);
+  --spring-bouncy: cubic-bezier(0.34, 1.45, 0.5, 1);
+  --d-spring: 0.46s;
+  --d-bouncy: 0.4s;
+
   --dur-1: 0.16s;
   --dur-2: 0.26s;
   --dur-3: 0.4s;
 }
 
+/* Damped springs (same samples as motion.ts): spring ζ0.8 k380 · bouncy ζ0.6 k800. */
+@supports (transition-timing-function: linear(0, 1)) {
+  :root {
+    --spring: linear(0, 0.023 2.5%, 0.081 5%, 0.16 7.5%, 0.251 10%, 0.345 12.5%, 0.439 15%, 0.528 17.5%, 0.61 20%,
+      0.681 22.5%, 0.746 25%, 0.802 27.5%, 0.849 30%, 0.889 32.5%, 0.921 35%, 0.947 37.5%, 0.967 40%, 0.982 42.5%,
+      0.994 45%, 1.002 47.5%, 1.008 50%, 1.011 52.5%, 1.014 55%, 1.014 60%, 1.013 65%, 1.01 70%, 1.008 75%, 1.005 80%,
+      1.003 85%, 1.002 90%, 1.001 95%, 1);
+    --spring-bouncy: linear(0, 0.038 2.5%, 0.13 5%, 0.254 7.5%, 0.386 10%, 0.526 12.5%, 0.658 15%, 0.769 17.5%,
+      0.868 20%, 0.948 22.5%, 1.005 25%, 1.048 27.5%, 1.075 30%, 1.089 32.5%, 1.093 35%, 1.09 37.5%, 1.082 40%,
+      1.071 42.5%, 1.058 45%, 1.046 47.5%, 1.033 50%, 1.022 52.5%, 1.013 55%, 1.006 57.5%, 1 60%, 0.996 62.5%,
+      0.993 65%, 0.991 70%, 0.992 75%, 0.994 80%, 0.997 85%, 0.999 90%, 1);
+  }
+}
+
+/* ----------------------------------------------------------- light theme */
+
 :root,
 [data-theme='light'] {
   color-scheme: light;
-  --bg: #edeff3;
-  --bg-2: #e4e8ef;
-  --card: #ffffff;
-  --card-2: #f6f7fa;
-  --ink: #12141a;
-  --ink-2: #4b5165;
-  --ink-3: #868ca0;
-  --line: rgba(18, 20, 26, 0.08);
-  --line-2: rgba(18, 20, 26, 0.16);
-  --dot: rgba(52, 62, 94, 0.16);
+  --bg: #eef0f8;
+  --card: #fbfbff;
+  --card-high: #e4e8f7;
+  --well: #eef0f8;
+  --well-2: #e2e5f1;
+  --nav: #fdfdff;
 
-  --navy: #343e5e;
-  --peri: #afc0e2;
-  --accent: #4c5e96;
-  --accent-2: #6f82bd;
-  --accent-soft: #e1e7f4;
-  --accent-ink: #2f3c66;
-  --track: #e6eaf2;
+  --ink: #191b23;
+  --ink-2: #464a5a;
+  --ink-3: #737788;
+  --outline: #767a8b;
+  --line: rgba(25, 27, 35, 0.08);
+  --line-2: rgba(25, 27, 35, 0.16);
 
-  --btn: #14161d;
-  --btn-ink: #ffffff;
-  --btn-soft: #e1e7f4;
-  --glass: rgba(255, 255, 255, 0.78);
-  --shadow: 0 1px 2px rgba(18, 20, 26, 0.04), 0 8px 24px -12px rgba(52, 62, 94, 0.18);
-  --shadow-lg: 0 24px 60px -24px rgba(31, 38, 64, 0.35);
+  --primary: #4a5c96;
+  --on-primary: #ffffff;
+  --pc: #dbe1ff;
+  --on-pc: #22336a;
+  --sc: #dfe3f5;
+  --on-sc: #2f3447;
+  --tertiary: #9a4f33;
+  --tc: #ffdbcc;
+  --on-tc: #5c2816;
 
-  --ok: #23885c;
-  --ok-soft: #dff3e9;
-  --warn: #a96a06;
-  --warn-soft: #fbefd6;
-  --bad: #c43d3d;
-  --bad-soft: #fbe3e3;
-  --glow-a: rgba(175, 192, 226, 0.55);
-  --glow-b: rgba(52, 62, 94, 0.14);
+  --error: #b3261e;
+  --on-error: #ffffff;
+  --ec: #fadad6;
+  --on-ec: #7a1410;
+  --ok: #1e7a4c;
+  --on-ok: #ffffff;
+  --ok-c: #d2f1de;
+  --on-ok-c: #0d4f2f;
+  --warn: #8f5b00;
+  --warn-c: #ffe2b0;
+  --on-warn-c: #5d3b00;
+
+  --inverse: #2f3139;
+  --on-inverse: #eff0f8;
+  --inverse-primary: #b5c4ff;
+  --inverse-ok: #7fd8a4;
+  --inverse-bad: #ffb4ab;
+
+  --scrim: rgba(12, 14, 22, 0.42);
+  --shadow-1: 0 1px 2px rgba(25, 27, 35, 0.06), 0 2px 6px -2px rgba(40, 52, 96, 0.1);
+  --shadow-2: 0 2px 6px -1px rgba(25, 27, 35, 0.08), 0 12px 28px -10px rgba(40, 52, 96, 0.22);
+  --shadow-3: 0 6px 16px -4px rgba(25, 27, 35, 0.1), 0 24px 56px -18px rgba(40, 52, 96, 0.32);
+
+  --glow-a: rgba(146, 166, 238, 0.36);
+  --glow-b: rgba(255, 186, 156, 0.2);
   --logo-filter: none;
+  --peri: #afc0e2;
 
-  /* chart series */
   /* chart series: validated categorical slots 1-3 (fixed order) */
   --c-1: #2a78d6;
   --c-2: #eb6834;
   --c-3: #1baf7a;
 }
 
+/* ------------------------------------------------------------ dark theme */
+
 [data-theme='dark'] {
   color-scheme: dark;
-  --bg: #0a0b0f;
-  --bg-2: #0f1117;
-  --card: #111319;
-  --card-2: #161922;
-  --ink: #eceef4;
-  --ink-2: #a6acbd;
-  --ink-3: #6c7286;
+  --bg: #101117;
+  --card: #1a1c23;
+  --card-high: #242836;
+  --well: #24262f;
+  --well-2: #2f323d;
+  --nav: #22242d;
+
+  --ink: #e4e5ef;
+  --ink-2: #bfc2d3;
+  --ink-3: #8d90a2;
+  --outline: #8e92a4;
   --line: rgba(255, 255, 255, 0.07);
-  --line-2: rgba(255, 255, 255, 0.15);
-  --dot: rgba(175, 192, 226, 0.13);
+  --line-2: rgba(255, 255, 255, 0.14);
 
-  --navy: #2a3250;
-  --peri: #9fb2de;
-  --accent: #9fb2de;
-  --accent-2: #c3d0ee;
-  --accent-soft: rgba(159, 178, 222, 0.12);
-  --accent-ink: #c9d5f1;
-  --track: rgba(255, 255, 255, 0.07);
+  --primary: #b0c0f2;
+  --on-primary: #172a5a;
+  --pc: #33437a;
+  --on-pc: #dce2ff;
+  --sc: #383d52;
+  --on-sc: #dfe3f7;
+  --tertiary: #ffb59a;
+  --tc: #6e3826;
+  --on-tc: #ffdbcc;
 
-  --btn: #eef1f7;
-  --btn-ink: #0b0c10;
-  --btn-soft: rgba(159, 178, 222, 0.14);
-  --glass: rgba(17, 19, 25, 0.78);
-  --shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset, 0 10px 30px -18px rgba(0, 0, 0, 0.9);
-  --shadow-lg: 0 30px 80px -30px rgba(0, 0, 0, 0.95);
+  --error: #ffb4ab;
+  --on-error: #690005;
+  --ec: #8c1d18;
+  --on-ec: #ffdad6;
+  --ok: #7fd8a4;
+  --on-ok: #003920;
+  --ok-c: #1d4a33;
+  --on-ok-c: #b6f2cf;
+  --warn: #f3c065;
+  --warn-c: #4f3a12;
+  --on-warn-c: #ffdea5;
 
-  --ok: #4cc38a;
-  --ok-soft: rgba(76, 195, 138, 0.13);
-  --warn: #e7b04a;
-  --warn-soft: rgba(231, 176, 74, 0.13);
-  --bad: #f07171;
-  --bad-soft: rgba(240, 113, 113, 0.13);
-  --glow-a: rgba(80, 98, 160, 0.3);
-  --glow-b: rgba(159, 178, 222, 0.08);
+  --inverse: #e3e4ee;
+  --on-inverse: #2e3038;
+  --inverse-primary: #4a5c96;
+  --inverse-ok: #1e7a4c;
+  --inverse-bad: #b3261e;
+
+  --scrim: rgba(0, 0, 0, 0.56);
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-2: 0 2px 6px -1px rgba(0, 0, 0, 0.4), 0 12px 28px -10px rgba(0, 0, 0, 0.6);
+  --shadow-3: 0 6px 16px -4px rgba(0, 0, 0, 0.45), 0 26px 60px -18px rgba(0, 0, 0, 0.75);
+
+  --glow-a: rgba(92, 112, 196, 0.22);
+  --glow-b: rgba(255, 160, 120, 0.06);
   --logo-filter: invert(1) brightness(0.96);
+  --peri: #9fb2de;
 
   --c-1: #3987e5;
   --c-2: #d95926;
   --c-3: #199e70;
 }
+
+/* Older names used across the pages, mapped onto the tonal roles. */
+:root {
+  --bg-2: var(--well-2);
+  --card-2: var(--well);
+  --accent: var(--primary);
+  --accent-2: var(--primary);
+  --accent-soft: var(--pc);
+  --accent-ink: var(--on-pc);
+  --track: var(--well-2);
+  --bad: var(--error);
+  --bad-soft: var(--ec);
+  --ok-soft: var(--ok-c);
+  --warn-soft: var(--warn-c);
+  --btn: var(--primary);
+  --btn-ink: var(--on-primary);
+  --btn-soft: var(--pc);
+  --shadow: var(--shadow-1);
+  --shadow-lg: var(--shadow-3);
+  --glass: color-mix(in srgb, var(--nav) 88%, transparent);
+  --dot: var(--line-2);
+}
+
+/* ------------------------------------------------------------------ reset */
 
 *,
 *::before,
@@ -133,7 +226,7 @@ body {
   font-feature-settings: 'ss01', 'cv11';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  transition: background-color 0.3s var(--ease), color 0.3s var(--ease);
+  -webkit-tap-highlight-color: transparent;
 }
 
 button,
@@ -152,6 +245,15 @@ button {
   text-align: inherit;
 }
 
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
 a {
   color: inherit;
   text-decoration: none;
@@ -165,9 +267,13 @@ p {
   margin: 0;
 }
 
+img {
+  max-width: 100%;
+}
+
 ::selection {
-  background: var(--peri);
-  color: #12141a;
+  background: var(--pc);
+  color: var(--on-pc);
 }
 
 .num {
@@ -205,7 +311,7 @@ p {
 }
 
 .bad-text {
-  color: var(--bad);
+  color: var(--error);
 }
 
 .ellipsis {
@@ -249,6 +355,44 @@ p {
   display: block;
 }
 
+.shape-defs {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+
+/* --------------------------------------------------------- theme change */
+
+/* Fallback cross-fade (no View Transitions): colours glide for a moment. */
+.is-theme-fading *,
+.is-theme-fading *::before,
+.is-theme-fading *::after {
+  transition-property: background-color, color, border-color, fill, stroke, box-shadow !important;
+  transition-duration: 0.4s !important;
+  transition-timing-function: var(--ease-emph) !important;
+}
+
+/* While the theme changes under View Transitions nothing may transition. */
+.is-theme-switching *,
+.is-theme-switching *::before,
+.is-theme-switching *::after {
+  transition: none !important;
+}
+
+:root.is-theme-morph::view-transition-old(root),
+:root.is-theme-morph::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+
+/* Window resize in progress (motion.ts): layout jumps straight to its new state. */
+.is-resizing *,
+.is-resizing *::before,
+.is-resizing *::after {
+  transition: none !important;
+}
+
 /* -------------------------------------------------------------- backdrop */
 
 .backdrop {
@@ -260,32 +404,26 @@ p {
   background: var(--bg);
 }
 
-.backdrop__grid {
-  position: absolute;
-  inset: 0;
-  background-image: radial-gradient(circle at center, var(--dot) 1px, transparent 1.4px);
-  background-size: 22px 22px;
-  -webkit-mask-image: radial-gradient(110% 60% at 60% 0%, #000 0%, rgba(0, 0, 0, 0.45) 45%, transparent 85%);
-  mask-image: radial-gradient(110% 60% at 60% 0%, #000 0%, rgba(0, 0, 0, 0.45) 45%, transparent 85%);
-}
-
 .backdrop__glow {
   position: absolute;
-  width: 900px;
-  height: 900px;
+  width: 120vw;
+  height: 120vw;
+  max-width: 920px;
+  max-height: 920px;
   border-radius: 50%;
+  will-change: transform;
 }
 
 .backdrop__glow--a {
-  top: -520px;
-  left: 10%;
+  top: -460px;
+  left: 8%;
   background: radial-gradient(closest-side, var(--glow-a), transparent);
   animation: float-a 26s var(--ease) infinite alternate;
 }
 
 .backdrop__glow--b {
-  bottom: -500px;
-  right: -300px;
+  top: 40vh;
+  right: -420px;
   background: radial-gradient(closest-side, var(--glow-b), transparent);
   animation: float-b 32s var(--ease) infinite alternate;
 }
@@ -305,14 +443,25 @@ p {
 /* ------------------------------------------------------------- motion */
 
 .reveal {
-  animation: reveal 0.5s var(--ease) both;
+  animation: reveal 0.62s var(--spring) both;
   animation-delay: var(--delay, 0ms);
 }
 
 @keyframes reveal {
   from {
     opacity: 0;
-    transform: translate3d(0, 8px, 0) scale(0.995);
+    transform: translate3d(0, 16px, 0) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes screen-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 12px, 0);
   }
   to {
     opacity: 1;
@@ -326,6 +475,13 @@ p {
   }
 }
 
+@keyframes pop {
+  from {
+    transform: scale(0.3);
+    opacity: 0;
+  }
+}
+
 @keyframes spin {
   to {
     transform: rotate(360deg);
@@ -334,6 +490,7 @@ p {
 
 @keyframes pulse {
   0% {
+    box-shadow: 0 0 0 0 rgba(128, 128, 140, 0.4);
     box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 45%, transparent);
   }
   70% {
@@ -345,12 +502,21 @@ p {
 }
 
 @keyframes shimmer {
-  from {
-    background-position: -200% 0;
-  }
   to {
-    background-position: 200% 0;
+    transform: translateX(100%);
   }
+}
+
+/* --------------------------------------------------------------- ripple */
+
+.ripple {
+  position: absolute;
+  z-index: 0;
+  border-radius: 50%;
+  background: rgba(128, 128, 140, 0.18);
+  background: color-mix(in srgb, currentColor 14%, transparent);
+  pointer-events: none;
+  will-change: transform, opacity;
 }
 
 @media (prefers-reduced-motion: reduce) {

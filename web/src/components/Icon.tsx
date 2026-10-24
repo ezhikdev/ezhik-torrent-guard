@@ -329,6 +329,9 @@ const paths: Record<string, JSX.Element> = {
   edit: <path d="M4 20h4L19 9l-4-4L4 16v4ZM13.5 6.5l4 4" />,
   zap: <path d="M13 2 4 14h7l-1 8 9-12h-7l1-8Z" />,
   rotate: <path d="M3 12a9 9 0 0 1 15.5-6.3L21 8M21 3v5h-5M21 12a9 9 0 0 1-15.5 6.3L3 16M3 21v-5h5" />,
+  /* Drawn with a thick stroke: round caps turn the points into dots. */
+  grip: <path d="M9 5.5h.01M15 5.5h.01M9 12h.01M15 12h.01M9 18.5h.01M15 18.5h.01" />,
+  sort: <path d="M7 4v16M3.5 16.5 7 20l3.5-3.5M17 20V4M13.5 7.5 17 4l3.5 3.5" />,
 };
 
 export function Icon({ name, size = 20, stroke = 1.75, class: cls }: { name: string; size?: number; stroke?: number; class?: string }) {
